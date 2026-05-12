@@ -1,10 +1,25 @@
+from copy import deepcopy
+from dataclasses import replace
+
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
+from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
-from mjlab.sensor import ContactMatch, ContactSensorCfg
+
+from mjlab.sensor import (
+    ContactMatch,
+    ContactSensorCfg,
+    ObjRef,
+    RayCastSensorCfg,
+    RingPatternCfg,
+    TerrainHeightSensorCfg,
+)
+
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
+from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 
 from bpx_mjlab.bpx.bpx_constants import (
     BPX_ACTION_SCALE,
@@ -128,7 +143,6 @@ def bpx_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 should_remove = True
 
         if should_remove:
-            print(f"remove reward term using raycast sensor: {reward_name}")
             cfg.rewards.pop(reward_name, None)
 
 
@@ -256,6 +270,235 @@ def bpx_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         if "actor" in cfg.observations:
             cfg.observations["actor"].enable_corruption = False
 
+        cfg.events.pop("push_robot", None)
+
+    return cfg
+
+
+def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    cfg = make_velocity_env_cfg()
+
+    cfg.sim.njmax = 1500
+    cfg.sim.nconmax = 192
+    cfg.sim.contact_sensor_maxmatch = 128
+    cfg.sim.mujoco.ccd_iterations = 50
+
+    cfg.scene.entities = {
+        "robot": get_bpx_robot_cfg(),
+    }
+    cfg.viewer.body_name = "torso"
+    cfg.viewer.distance = 2.5
+    cfg.viewer.elevation = -10.0
+
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.terrain_type = "generator"
+    cfg.scene.terrain.terrain_generator = replace(ROUGH_TERRAINS_CFG)
+    cfg.scene.terrain.terrain_generator.curriculum = True
+    cfg.scene.terrain.max_init_terrain_level = 1
+    cfg.scene.extent = 3.0
+
+    for sensor in cfg.scene.sensors or ():
+        if sensor.name == "terrain_scan":
+            assert isinstance(sensor, RayCastSensorCfg)
+            assert isinstance(sensor.frame, ObjRef)
+            sensor.frame.name = "torso"
+            sensor.debug_vis = False
+        elif sensor.name == "foot_height_scan":
+            assert isinstance(sensor, TerrainHeightSensorCfg)
+            sensor.frame = tuple(
+                ObjRef(type="site", name=site_name, entity="robot")
+                for site_name in FOOT_SITES
+            )
+            sensor.pattern = RingPatternCfg.single_ring(radius=0.035, num_samples=4)
+            sensor.debug_vis = False
+
+    feet_ground_cfg = ContactSensorCfg(
+        name="feet_ground_contact",
+        primary=ContactMatch(
+            mode="geom",
+            pattern=FOOT_GEOMS,
+            entity="robot",
+        ),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found", "force"),
+        reduce="netforce",
+        num_slots=1,
+        track_air_time=True,
+    )
+    nonfoot_ground_cfg = ContactSensorCfg(
+        name="nonfoot_ground_touch",
+        primary=ContactMatch(
+            mode="geom",
+            entity="robot",
+            pattern=r".*_collision_\d+$",
+            exclude=FOOT_GEOMS,
+        ),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found",),
+        reduce="none",
+        num_slots=1,
+    )
+    cfg.scene.sensors = (cfg.scene.sensors or ()) + (
+        feet_ground_cfg,
+        nonfoot_ground_cfg,
+    )
+
+    joint_pos_action = cfg.actions["joint_pos"]
+    assert isinstance(joint_pos_action, JointPositionActionCfg)
+    joint_pos_action.scale = BPX_ACTION_SCALE
+
+    if "foot_friction" in cfg.events:
+        _safe_set_asset_names(
+            cfg.events["foot_friction"],
+            "geom_names",
+            FOOT_GEOMS,
+        )
+    if "base_com" in cfg.events:
+        _safe_set_asset_names(
+            cfg.events["base_com"],
+            "body_names",
+            ("torso",),
+        )
+
+    if "pose" in cfg.rewards:
+        cfg.rewards["pose"].params["std_standing"] = {
+            ".*_hip_roll_joint": 0.05,
+            ".*_hip_pitch_joint": 0.10,
+            ".*_knee_joint": 0.10,
+        }
+        cfg.rewards["pose"].params["std_walking"] = {
+            ".*_hip_roll_joint": 0.30,
+            ".*_hip_pitch_joint": 0.30,
+            ".*_knee_joint": 0.60,
+        }
+        cfg.rewards["pose"].params["std_running"] = {
+            ".*_hip_roll_joint": 0.35,
+            ".*_hip_pitch_joint": 0.35,
+            ".*_knee_joint": 0.70,
+        }
+    if "upright" in cfg.rewards:
+        _safe_set_asset_names(cfg.rewards["upright"], "body_names", ("torso",))
+    if "body_ang_vel" in cfg.rewards:
+        _safe_set_asset_names(cfg.rewards["body_ang_vel"], "body_names", ("torso",))
+    for reward_name in ("foot_clearance", "foot_slip"):
+        if reward_name in cfg.rewards:
+            _safe_set_asset_names(cfg.rewards[reward_name], "site_names", FOOT_SITES)
+
+    for reward_name in ("body_ang_vel", "angular_momentum"):
+        if reward_name in cfg.rewards:
+            cfg.rewards[reward_name].weight = 0.0
+    if "air_time" in cfg.rewards:
+        cfg.rewards["air_time"].weight = 0.2
+
+    cfg.terminations["illegal_contact"] = TerminationTermCfg(
+        func=mdp.illegal_contact,
+        params={"sensor_name": nonfoot_ground_cfg.name},
+    )
+
+    cmd = cfg.commands["twist"]
+    assert isinstance(cmd, UniformVelocityCommandCfg)
+    cmd.viz.z_offset = 0.5
+    cmd.ranges.lin_vel_x = (-0.25, 0.8)
+    cmd.ranges.lin_vel_y = (-0.15, 0.15)
+    cmd.ranges.ang_vel_z = (-0.35, 0.35)
+    cmd.rel_standing_envs = 0.02
+    cmd.rel_forward_envs = 0.5
+    cmd.resampling_time_range = (4.0, 8.0)
+
+    cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
+        func=mdp.terrain_levels_vel,
+        params={"command_name": "twist"},
+    )
+    cfg.curriculum["command_vel"] = CurriculumTermCfg(
+        func=mdp.commands_vel,
+        params={
+            "command_name": "twist",
+            "velocity_stages": [
+                {
+                    "step": 0,
+                    "lin_vel_x": (-0.25, 0.8),
+                    "lin_vel_y": (-0.15, 0.15),
+                    "ang_vel_z": (-0.35, 0.35),
+                },
+                {
+                    "step": 3000 * 24,
+                    "lin_vel_x": (-0.35, 1.0),
+                    "lin_vel_y": (-0.20, 0.20),
+                    "ang_vel_z": (-0.45, 0.45),
+                },
+                {
+                    "step": 7000 * 24,
+                    "lin_vel_x": (-0.50, 1.30),
+                    "lin_vel_y": (-0.30, 0.30),
+                    "ang_vel_z": (-0.60, 0.60),
+                },
+            ],
+        },
+    )
+
+    base_actor_terms = cfg.observations["actor"].terms
+    base_critic_terms = cfg.observations["critic"].terms
+    actor_term_names = (
+        "base_ang_vel",
+        "projected_gravity",
+        "joint_pos",
+        "joint_vel",
+        "actions",
+        "command",
+    )
+    privileged_term_names = (
+        "base_lin_vel",
+        "height_scan",
+        "foot_height",
+        "foot_air_time",
+        "foot_contact",
+        "foot_contact_forces",
+    )
+
+    actor_terms = {
+        name: deepcopy(base_actor_terms[name])
+        for name in actor_term_names
+    }
+    critic_terms = {
+        name: deepcopy(base_critic_terms[name])
+        for name in (*actor_term_names, *privileged_term_names)
+    }
+    estimator_target_terms = {
+        "base_lin_vel": deepcopy(base_critic_terms["base_lin_vel"]),
+        "height_scan": deepcopy(base_critic_terms["height_scan"]),
+    }
+
+    cfg.observations = {
+        "actor": ObservationGroupCfg(
+            terms=actor_terms,
+            concatenate_terms=True,
+            enable_corruption=not play,
+            nan_policy="sanitize",
+        ),
+        "actor_history": ObservationGroupCfg(
+            terms=deepcopy(actor_terms),
+            concatenate_terms=True,
+            enable_corruption=not play,
+            history_length=10,
+            flatten_history_dim=True,
+            nan_policy="sanitize",
+        ),
+        "critic": ObservationGroupCfg(
+            terms=critic_terms,
+            concatenate_terms=True,
+            enable_corruption=False,
+            nan_policy="sanitize",
+        ),
+        "estimator_target": ObservationGroupCfg(
+            terms=estimator_target_terms,
+            concatenate_terms=True,
+            enable_corruption=False,
+            nan_policy="sanitize",
+        ),
+    }
+
+    if play:
+        cfg.episode_length_s = int(1e9)
         cfg.events.pop("push_robot", None)
 
     return cfg
