@@ -1,6 +1,8 @@
 from copy import deepcopy
 from dataclasses import replace
 
+import torch
+
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
@@ -65,6 +67,65 @@ def _safe_set_asset_names(term, field_name: str, names: tuple[str, ...]) -> bool
 def _safe_pop_term(term_dict, key: str) -> None:
     if term_dict is not None and key in term_dict:
         term_dict.pop(key, None)
+
+
+def _bpx_terrain_levels_vel(
+    env,
+    env_ids: torch.Tensor,
+    command_name: str,
+    promotion_distance_ratio: float = 0.75,
+    demotion_command_ratio: float = 0.5,
+) -> dict[str, torch.Tensor]:
+    asset = env.scene["robot"]
+    terrain = env.scene.terrain
+    assert terrain is not None
+    terrain_generator = terrain.cfg.terrain_generator
+    assert terrain_generator is not None
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+
+    distance = torch.norm(
+        asset.data.root_link_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2],
+        dim=1,
+    )
+    promotion_distance = terrain_generator.size[0] * promotion_distance_ratio
+
+    # 只有真正跑满 episode 的轨迹才允许升级，避免高等级地形过早堆上来。
+    timed_out = env.termination_manager.get_term("time_out")[env_ids]
+    move_up = (distance > promotion_distance) & timed_out
+
+    move_down = (
+        distance
+        < torch.norm(command[env_ids, :2], dim=1)
+        * env.max_episode_length_s
+        * demotion_command_ratio
+    )
+    move_down &= ~move_up
+
+    terrain.update_env_origins(env_ids, move_up, move_down)
+
+    levels = terrain.terrain_levels.float()
+    result: dict[str, torch.Tensor] = {
+        "mean": torch.mean(levels),
+        "max": torch.max(levels),
+        "promotion_distance": torch.tensor(promotion_distance, device=env.device),
+        "move_up_rate": torch.mean(move_up.float()),
+        "move_down_rate": torch.mean(move_down.float()),
+    }
+
+    sub_terrain_names = list(terrain_generator.sub_terrains.keys())
+    terrain_origins = terrain.terrain_origins
+    assert terrain_origins is not None
+    num_cols = terrain_origins.shape[1]
+    if num_cols == len(sub_terrain_names):
+        types = terrain.terrain_types
+        for i, name in enumerate(sub_terrain_names):
+            mask = types == i
+            if mask.any():
+                result[name] = torch.mean(levels[mask])
+
+    return result
 
 
 def bpx_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -406,8 +467,12 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cmd.resampling_time_range = (4.0, 8.0)
 
     cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
-        func=mdp.terrain_levels_vel,
-        params={"command_name": "twist"},
+        func=_bpx_terrain_levels_vel,
+        params={
+            "command_name": "twist",
+            "promotion_distance_ratio": 0.75,
+            "demotion_command_ratio": 0.5,
+        },
     )
     cfg.curriculum["command_vel"] = CurriculumTermCfg(
         func=mdp.commands_vel,
