@@ -7,6 +7,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
 from mjlab.sensor import (
@@ -450,6 +451,10 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             cfg.rewards[reward_name].weight = 0.0
     if "air_time" in cfg.rewards:
         cfg.rewards["air_time"].weight = 0.2
+    cfg.rewards["termination"] = RewardTermCfg(
+        func=mdp.is_terminated,
+        weight=-25.0,
+    )
 
     cfg.terminations["illegal_contact"] = TerminationTermCfg(
         func=mdp.illegal_contact,
@@ -486,16 +491,16 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                     "ang_vel_z": (-0.35, 0.35),
                 },
                 {
-                    "step": 3000 * 24,
-                    "lin_vel_x": (-0.35, 1.0),
-                    "lin_vel_y": (-0.20, 0.20),
-                    "ang_vel_z": (-0.45, 0.45),
+                    "step": 5000 * 24,
+                    "lin_vel_x": (-0.30, 0.95),
+                    "lin_vel_y": (-0.18, 0.18),
+                    "ang_vel_z": (-0.40, 0.40),
                 },
                 {
-                    "step": 7000 * 24,
-                    "lin_vel_x": (-0.50, 1.30),
-                    "lin_vel_y": (-0.30, 0.30),
-                    "ang_vel_z": (-0.60, 0.60),
+                    "step": 12000 * 24,
+                    "lin_vel_x": (-0.35, 1.10),
+                    "lin_vel_y": (-0.22, 0.22),
+                    "ang_vel_z": (-0.45, 0.45),
                 },
             ],
         },
