@@ -571,14 +571,14 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             _safe_set_asset_names(cfg.rewards[reward_name], "site_names", FOOT_SITES)
 
     if "track_linear_velocity" in cfg.rewards:
-        cfg.rewards["track_linear_velocity"].weight = 3.0
+        cfg.rewards["track_linear_velocity"].weight = 3.5
         cfg.rewards["track_linear_velocity"].params["std"] = 0.35
     if "track_angular_velocity" in cfg.rewards:
         cfg.rewards["track_angular_velocity"].weight = 2.5
         cfg.rewards["track_angular_velocity"].params["std"] = 0.45
     cfg.rewards["track_forward_velocity_fine"] = RewardTermCfg(
         func=_bpx_track_forward_velocity,
-        weight=1.0,
+        weight=1.4,
         params={"command_name": "twist", "std": 0.25},
     )
     cfg.rewards["track_lateral_velocity_fine"] = RewardTermCfg(
@@ -654,22 +654,40 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                     "ang_vel_z": (-0.25, 0.25),
                 },
                 {
-                    "step": 6000 * 24,
+                    "step": 6000 * 16,
                     "lin_vel_x": (-0.30, 0.95),
                     "lin_vel_y": (-0.18, 0.18),
                     "ang_vel_z": (-0.40, 0.40),
                 },
                 {
-                    "step": 12000 * 24,
-                    "lin_vel_x": (-0.35, 1.05),
+                    "step": 12000 * 16,
+                    "lin_vel_x": (-0.35, 1.10),
                     "lin_vel_y": (-0.22, 0.22),
                     "ang_vel_z": (-0.48, 0.48),
                 },
                 {
-                    "step": 18000 * 24,
-                    "lin_vel_x": (-0.45, 1.20),
+                    "step": 18000 * 16,
+                    "lin_vel_x": (-0.45, 1.25),
                     "lin_vel_y": (-0.30, 0.30),
                     "ang_vel_z": (-0.60, 0.60),
+                },
+                {
+                    "step": 26000 * 16,
+                    "lin_vel_x": (-0.50, 1.40),
+                    "lin_vel_y": (-0.30, 0.30),
+                    "ang_vel_z": (-0.60, 0.60),
+                },
+                {
+                    "step": 36000 * 16,
+                    "lin_vel_x": (-0.55, 1.60),
+                    "lin_vel_y": (-0.32, 0.32),
+                    "ang_vel_z": (-0.65, 0.65),
+                },
+                {
+                    "step": 45000 * 16,
+                    "lin_vel_x": (-0.60, 1.80),
+                    "lin_vel_y": (-0.35, 0.35),
+                    "ang_vel_z": (-0.70, 0.70),
                 },
             ],
         },

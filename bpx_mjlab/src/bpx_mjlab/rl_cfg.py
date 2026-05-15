@@ -42,7 +42,7 @@ def bpx_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
 def bpx_waq_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     return RslRlOnPolicyRunnerCfg(
         num_steps_per_env=16,
-        max_iterations=30_000,
+        max_iterations=50_000,
         obs_groups={
             "actor": ("actor",),
             "actor_history": ("actor_history",),
@@ -71,5 +71,5 @@ def bpx_waq_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         ),
         experiment_name="bpx_waq_rough",
         run_name="dreamwaq",
-        save_interval=50,
+        save_interval=200,
     )
