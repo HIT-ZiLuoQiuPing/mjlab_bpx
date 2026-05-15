@@ -10,9 +10,9 @@ from mjlab.rl import (
 @dataclass
 class DreamWaqAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name: str = "bpx_mjlab.waq.algorithm:DreamWaqPPO"
-    latent_dim: int = 16
-    encoder_hidden_dims: tuple[int, ...] = (256, 128)
-    decoder_hidden_dims: tuple[int, ...] = (128, 256)
+    latent_dim: int = 24
+    encoder_hidden_dims: tuple[int, ...] = (512, 256)
+    decoder_hidden_dims: tuple[int, ...] = (256, 512)
     velocity_loss_coef: float = 1.0
     terrain_loss_coef: float = 0.2
     kl_loss_coef: float = 1.0e-3
@@ -42,7 +42,7 @@ def bpx_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
 def bpx_waq_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     return RslRlOnPolicyRunnerCfg(
         num_steps_per_env=16,
-        max_iterations=20_000,
+        max_iterations=30_000,
         obs_groups={
             "actor": ("actor",),
             "actor_history": ("actor_history",),
