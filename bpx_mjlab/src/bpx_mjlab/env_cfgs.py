@@ -84,6 +84,42 @@ def _safe_pop_term(term_dict, key: str) -> None:
         term_dict.pop(key, None)
 
 
+def _bpx_track_forward_velocity(
+    env,
+    command_name: str,
+    std: float,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    error = command[:, 0] - asset.data.root_link_lin_vel_b[:, 0]
+    return torch.exp(-(error.square()) / std**2)
+
+
+def _bpx_track_lateral_velocity(
+    env,
+    command_name: str,
+    std: float,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    error = command[:, 1] - asset.data.root_link_lin_vel_b[:, 1]
+    return torch.exp(-(error.square()) / std**2)
+
+
+def _bpx_track_yaw_velocity(
+    env,
+    command_name: str,
+    std: float,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    error = command[:, 2] - asset.data.root_link_ang_vel_b[:, 2]
+    return torch.exp(-(error.square()) / std**2)
+
+
 def _bpx_terrain_levels_vel(
     env,
     env_ids: torch.Tensor,
@@ -371,13 +407,13 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     terrain_generator = deepcopy(ROUGH_TERRAINS_CFG)
     terrain_generator.curriculum = True
     terrain_proportions = {
-        "flat": 0.15,
-        "pyramid_stairs": 0.25,
-        "pyramid_stairs_inv": 0.10,
-        "hf_pyramid_slope": 0.20,
-        "hf_pyramid_slope_inv": 0.10,
-        "random_rough": 0.10,
-        "wave_terrain": 0.10,
+        "flat": 0.12,
+        "pyramid_stairs": 0.20,
+        "pyramid_stairs_inv": 0.08,
+        "hf_pyramid_slope": 0.25,
+        "hf_pyramid_slope_inv": 0.20,
+        "random_rough": 0.08,
+        "wave_terrain": 0.07,
     }
     for terrain_name, proportion in terrain_proportions.items():
         if terrain_name in terrain_generator.sub_terrains:
@@ -387,6 +423,9 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             stairs_cfg = terrain_generator.sub_terrains[terrain_name]
             stairs_cfg.step_width = 0.35
             stairs_cfg.step_height_range = (0.0, 0.08)
+    for terrain_name in ("hf_pyramid_slope", "hf_pyramid_slope_inv"):
+        if terrain_name in terrain_generator.sub_terrains:
+            terrain_generator.sub_terrains[terrain_name].slope_range = (0.0, 0.85)
     cfg.scene.terrain.terrain_generator = terrain_generator
     cfg.scene.terrain.max_init_terrain_level = 1
     cfg.scene.extent = 3.0
@@ -486,6 +525,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         }
     if "upright" in cfg.rewards:
         _safe_set_asset_names(cfg.rewards["upright"], "body_names", ("torso",))
+        cfg.rewards["upright"].params["terrain_sensor_names"] = ("terrain_scan",)
     if "body_ang_vel" in cfg.rewards:
         _safe_set_asset_names(cfg.rewards["body_ang_vel"], "body_names", ("torso",))
     for reward_name in ("foot_clearance", "foot_slip"):
@@ -498,6 +538,21 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     if "track_angular_velocity" in cfg.rewards:
         cfg.rewards["track_angular_velocity"].weight = 2.5
         cfg.rewards["track_angular_velocity"].params["std"] = 0.45
+    cfg.rewards["track_forward_velocity_fine"] = RewardTermCfg(
+        func=_bpx_track_forward_velocity,
+        weight=1.0,
+        params={"command_name": "twist", "std": 0.25},
+    )
+    cfg.rewards["track_lateral_velocity_fine"] = RewardTermCfg(
+        func=_bpx_track_lateral_velocity,
+        weight=1.2,
+        params={"command_name": "twist", "std": 0.16},
+    )
+    cfg.rewards["track_yaw_velocity_fine"] = RewardTermCfg(
+        func=_bpx_track_yaw_velocity,
+        weight=1.0,
+        params={"command_name": "twist", "std": 0.30},
+    )
     if "body_ang_vel" in cfg.rewards:
         cfg.rewards["body_ang_vel"].weight = -0.05
     if "angular_momentum" in cfg.rewards:
@@ -551,13 +606,19 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                     "ang_vel_z": (-0.25, 0.25),
                 },
                 {
-                    "step": 5000 * 24,
+                    "step": 6000 * 24,
                     "lin_vel_x": (-0.30, 0.95),
                     "lin_vel_y": (-0.18, 0.18),
                     "ang_vel_z": (-0.40, 0.40),
                 },
                 {
                     "step": 12000 * 24,
+                    "lin_vel_x": (-0.35, 1.05),
+                    "lin_vel_y": (-0.22, 0.22),
+                    "ang_vel_z": (-0.48, 0.48),
+                },
+                {
+                    "step": 18000 * 24,
                     "lin_vel_x": (-0.45, 1.20),
                     "lin_vel_y": (-0.30, 0.30),
                     "ang_vel_z": (-0.60, 0.60),
