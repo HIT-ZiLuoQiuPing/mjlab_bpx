@@ -120,6 +120,44 @@ def _bpx_track_yaw_velocity(
     return torch.exp(-(error.square()) / std**2)
 
 
+def _bpx_forward_lateral_drift(
+    env,
+    command_name: str,
+    min_forward_command: float = 0.2,
+    lateral_command_threshold: float = 0.05,
+    yaw_command_threshold: float = 0.05,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    straight = (
+        (command[:, 0] > min_forward_command)
+        & (torch.abs(command[:, 1]) < lateral_command_threshold)
+        & (torch.abs(command[:, 2]) < yaw_command_threshold)
+    )
+    lateral_velocity = asset.data.root_link_lin_vel_b[:, 1]
+    return lateral_velocity.square() * straight.float()
+
+
+def _bpx_forward_yaw_drift(
+    env,
+    command_name: str,
+    min_forward_command: float = 0.2,
+    lateral_command_threshold: float = 0.05,
+    yaw_command_threshold: float = 0.05,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    straight = (
+        (command[:, 0] > min_forward_command)
+        & (torch.abs(command[:, 1]) < lateral_command_threshold)
+        & (torch.abs(command[:, 2]) < yaw_command_threshold)
+    )
+    yaw_velocity = asset.data.root_link_ang_vel_b[:, 2]
+    return yaw_velocity.square() * straight.float()
+
+
 def _bpx_terrain_levels_vel(
     env,
     env_ids: torch.Tensor,
@@ -553,6 +591,16 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=1.0,
         params={"command_name": "twist", "std": 0.30},
     )
+    cfg.rewards["forward_lateral_drift"] = RewardTermCfg(
+        func=_bpx_forward_lateral_drift,
+        weight=-1.5,
+        params={"command_name": "twist"},
+    )
+    cfg.rewards["forward_yaw_drift"] = RewardTermCfg(
+        func=_bpx_forward_yaw_drift,
+        weight=-0.8,
+        params={"command_name": "twist"},
+    )
     if "body_ang_vel" in cfg.rewards:
         cfg.rewards["body_ang_vel"].weight = -0.05
     if "angular_momentum" in cfg.rewards:
@@ -583,7 +631,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cmd.ranges.lin_vel_y = (-0.10, 0.10)
     cmd.ranges.ang_vel_z = (-0.25, 0.25)
     cmd.rel_standing_envs = 0.02
-    cmd.rel_forward_envs = 0.5
+    cmd.rel_forward_envs = 0.75
     cmd.resampling_time_range = (6.0, 10.0)
 
     cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
