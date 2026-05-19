@@ -22,6 +22,7 @@ from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.terrains.config import ROUGH_TERRAINS_CFG
+from mjlab.utils.lab_api.math import euler_xyz_from_quat, wrap_to_pi
 
 from bpx_mjlab.bpx.bpx_constants import (
     BPX_ACTION_SCALE,
@@ -121,6 +122,19 @@ def _bpx_track_yaw_velocity(
     error = command[:, 2] - asset.data.root_link_ang_vel_b[:, 2]
     return torch.exp(-(error.square()) / std**2)
 
+
+def _bpx_straight_command_mask(
+    command: torch.Tensor,
+    min_forward_command: float,
+    lateral_command_threshold: float,
+    yaw_command_threshold: float,
+) -> torch.Tensor:
+    return (
+        (command[:, 0] > min_forward_command)
+        & (torch.abs(command[:, 1]) < lateral_command_threshold)
+        & (torch.abs(command[:, 2]) < yaw_command_threshold)
+    )
+
 # 当机器人有明显的前向速度但命令要求它直行时，惩罚它的横向速度，鼓励它减少漂移。
 def _bpx_forward_lateral_drift(
     env,
@@ -132,10 +146,11 @@ def _bpx_forward_lateral_drift(
     asset = env.scene["robot"]
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
-    straight = (
-        (command[:, 0] > min_forward_command)
-        & (torch.abs(command[:, 1]) < lateral_command_threshold)
-        & (torch.abs(command[:, 2]) < yaw_command_threshold)
+    straight = _bpx_straight_command_mask(
+        command,
+        min_forward_command,
+        lateral_command_threshold,
+        yaw_command_threshold,
     )
     lateral_velocity = asset.data.root_link_lin_vel_b[:, 1]
     return lateral_velocity.square() * straight.float()
@@ -151,13 +166,76 @@ def _bpx_forward_yaw_drift(
     asset = env.scene["robot"]
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
-    straight = (
-        (command[:, 0] > min_forward_command)
-        & (torch.abs(command[:, 1]) < lateral_command_threshold)
-        & (torch.abs(command[:, 2]) < yaw_command_threshold)
+    straight = _bpx_straight_command_mask(
+        command,
+        min_forward_command,
+        lateral_command_threshold,
+        yaw_command_threshold,
     )
     yaw_velocity = asset.data.root_link_ang_vel_b[:, 2]
     return yaw_velocity.square() * straight.float()
+
+
+class _BpxForwardLateralPositionDrift:
+    def __init__(self, cfg: RewardTermCfg, env):
+        self._env = env
+        self._initial_y = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids: torch.Tensor) -> None:
+        asset = self._env.scene["robot"]
+        self._initial_y[env_ids] = asset.data.root_link_pos_w[env_ids, 1]
+
+    def __call__(
+        self,
+        env,
+        command_name: str,
+        min_forward_command: float = 0.2,
+        lateral_command_threshold: float = 0.08,
+        yaw_command_threshold: float = 0.08,
+    ) -> torch.Tensor:
+        asset = env.scene["robot"]
+        command = env.command_manager.get_command(command_name)
+        assert command is not None, f"Command '{command_name}' not found."
+        straight = _bpx_straight_command_mask(
+            command,
+            min_forward_command,
+            lateral_command_threshold,
+            yaw_command_threshold,
+        )
+        lateral_offset = asset.data.root_link_pos_w[:, 1] - self._initial_y
+        return lateral_offset.square() * straight.float()
+
+
+class _BpxForwardHeadingDrift:
+    def __init__(self, cfg: RewardTermCfg, env):
+        self._env = env
+        self._initial_yaw = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids: torch.Tensor) -> None:
+        asset = self._env.scene["robot"]
+        _, _, yaw = euler_xyz_from_quat(asset.data.root_link_quat_w)
+        self._initial_yaw[env_ids] = yaw[env_ids]
+
+    def __call__(
+        self,
+        env,
+        command_name: str,
+        min_forward_command: float = 0.2,
+        lateral_command_threshold: float = 0.08,
+        yaw_command_threshold: float = 0.08,
+    ) -> torch.Tensor:
+        asset = env.scene["robot"]
+        command = env.command_manager.get_command(command_name)
+        assert command is not None, f"Command '{command_name}' not found."
+        straight = _bpx_straight_command_mask(
+            command,
+            min_forward_command,
+            lateral_command_threshold,
+            yaw_command_threshold,
+        )
+        _, _, yaw = euler_xyz_from_quat(asset.data.root_link_quat_w)
+        heading_error = wrap_to_pi(yaw - self._initial_yaw)
+        return heading_error.square() * straight.float()
 
 # 根据机器人与环境原点的距离以及命令的速度，动态调整地形难度等级，鼓励机器人逐渐适应更复杂的地形，同时避免过早或过快地增加难度。
 def _bpx_terrain_levels_vel(
@@ -466,14 +544,15 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.scene.entities = {
         "robot": get_bpx_robot_cfg(),
     }
+    # 可视化视角
     cfg.viewer.body_name = "torso" # Viewer 跟随 BPX 主躯干，确保在崎岖地形上训练时能更好地观察机器人的整体姿态和运动。
     cfg.viewer.distance = 2.5 # 适当拉远一些观察距离，以便在崎岖地形上更好地观察机器人和周围环境的交互。
     cfg.viewer.elevation = -10.0 # 保持较低的仰角，以更好地观察机器人在崎岖地形上的运动细节和地形特征。
 
-
-    assert cfg.scene.terrain is not None
-    cfg.scene.terrain.terrain_type = "generator"
-    terrain_generator = deepcopy(ROUGH_TERRAINS_CFG)
+    # 地形配置：使用生成器生成崎岖地形，配置不同类型地形的比例，并调整一些特定地形的参数，以提供多样化的训练环境，帮助机器人学习在不同崎岖地形上的速度跟踪能力。
+    assert cfg.scene.terrain is not None # 确认地形配置存在。
+    cfg.scene.terrain.terrain_type = "generator" # 设置地形类型为生成器。
+    terrain_generator = deepcopy(ROUGH_TERRAINS_CFG) # 复制一份崎岖地形配置
     terrain_generator.curriculum = True
     terrain_proportions = {
         "flat": 0.12,
@@ -605,8 +684,8 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         cfg.rewards["track_linear_velocity"].weight = 3.5
         cfg.rewards["track_linear_velocity"].params["std"] = 0.35
     if "track_angular_velocity" in cfg.rewards:
-        cfg.rewards["track_angular_velocity"].weight = 3.0
-        cfg.rewards["track_angular_velocity"].params["std"] = 0.35
+        cfg.rewards["track_angular_velocity"].weight = 4.0
+        cfg.rewards["track_angular_velocity"].params["std"] = 0.28
     cfg.rewards["track_forward_velocity_fine"] = RewardTermCfg(
         func=_bpx_track_forward_velocity,
         weight=1.4,
@@ -614,17 +693,17 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.rewards["track_lateral_velocity_fine"] = RewardTermCfg(
         func=_bpx_track_lateral_velocity,
-        weight=1.7,
-        params={"command_name": "twist", "std": 0.12},
+        weight=2.0,
+        params={"command_name": "twist", "std": 0.10},
     )
     cfg.rewards["track_yaw_velocity_fine"] = RewardTermCfg(
         func=_bpx_track_yaw_velocity,
-        weight=1.5,
-        params={"command_name": "twist", "std": 0.22},
+        weight=2.2,
+        params={"command_name": "twist", "std": 0.18},
     )
     cfg.rewards["forward_lateral_drift"] = RewardTermCfg(
         func=_bpx_forward_lateral_drift,
-        weight=-3.0,
+        weight=-5.0,
         params={
             "command_name": "twist",
             "lateral_command_threshold": 0.08,
@@ -633,12 +712,22 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.rewards["forward_yaw_drift"] = RewardTermCfg(
         func=_bpx_forward_yaw_drift,
-        weight=-1.8,
+        weight=-3.0,
         params={
             "command_name": "twist",
             "lateral_command_threshold": 0.08,
             "yaw_command_threshold": 0.08,
         },
+    )
+    cfg.rewards["forward_lateral_position_drift"] = RewardTermCfg(
+        func=_BpxForwardLateralPositionDrift,
+        weight=-0.4,
+        params={"command_name": "twist"},
+    )
+    cfg.rewards["forward_heading_drift"] = RewardTermCfg(
+        func=_BpxForwardHeadingDrift,
+        weight=-1.5,
+        params={"command_name": "twist"},
     )
     if "body_ang_vel" in cfg.rewards:
         cfg.rewards["body_ang_vel"].weight = -0.08
@@ -673,10 +762,10 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     assert isinstance(cmd, UniformVelocityCommandCfg)
     cmd.viz.z_offset = 0.5
     cmd.ranges.lin_vel_x = (-0.20, 0.75)
-    cmd.ranges.lin_vel_y = (-0.10, 0.10)
-    cmd.ranges.ang_vel_z = (-0.25, 0.25)
+    cmd.ranges.lin_vel_y = (-0.04, 0.04)
+    cmd.ranges.ang_vel_z = (-0.08, 0.08)
     cmd.rel_standing_envs = 0.02
-    cmd.rel_forward_envs = 0.85
+    cmd.rel_forward_envs = 0.90
     cmd.resampling_time_range = (6.0, 10.0)
 
     cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
@@ -704,41 +793,47 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 {
                     "step": 0,
                     "lin_vel_x": (-0.20, 0.75),
-                    "lin_vel_y": (-0.10, 0.10),
-                    "ang_vel_z": (-0.25, 0.25),
+                    "lin_vel_y": (-0.04, 0.04),
+                    "ang_vel_z": (-0.08, 0.08),
                 },
                 {
                     "step": 6000 * 16,
                     "lin_vel_x": (-0.25, 0.85),
-                    "lin_vel_y": (-0.12, 0.12),
-                    "ang_vel_z": (-0.30, 0.30),
+                    "lin_vel_y": (-0.05, 0.05),
+                    "ang_vel_z": (-0.10, 0.10),
                 },
                 {
                     "step": 12000 * 16,
                     "lin_vel_x": (-0.30, 1.05),
-                    "lin_vel_y": (-0.16, 0.16),
-                    "ang_vel_z": (-0.40, 0.40),
+                    "lin_vel_y": (-0.06, 0.06),
+                    "ang_vel_z": (-0.12, 0.12),
                 },
                 {
                     "step": 20000 * 16,
                     "lin_vel_x": (-0.45, 1.25),
-                    "lin_vel_y": (-0.20, 0.20),
-                    "ang_vel_z": (-0.45, 0.45),
+                    "lin_vel_y": (-0.08, 0.08),
+                    "ang_vel_z": (-0.16, 0.16),
                 },
                 {
                     "step": 30000 * 16,
                     "lin_vel_x": (-0.45, 1.45),
+                    "lin_vel_y": (-0.10, 0.10),
+                    "ang_vel_z": (-0.20, 0.20),
+                },
+                {
+                    "step": 38000 * 16,
+                    "lin_vel_x": (-0.50, 1.60),
+                    "lin_vel_y": (-0.16, 0.16),
+                    "ang_vel_z": (-0.35, 0.35),
+                },
+                {
+                    "step": 45000 * 16,
+                    "lin_vel_x": (-0.55, 1.80),
                     "lin_vel_y": (-0.24, 0.24),
                     "ang_vel_z": (-0.50, 0.50),
                 },
                 {
-                    "step": 40000 * 16,
-                    "lin_vel_x": (-0.50, 1.65),
-                    "lin_vel_y": (-0.28, 0.28),
-                    "ang_vel_z": (-0.55, 0.55),
-                },
-                {
-                    "step": 45000 * 16,
+                    "step": 48000 * 16,
                     "lin_vel_x": (-0.55, 1.80),
                     "lin_vel_y": (-0.30, 0.30),
                     "ang_vel_z": (-0.60, 0.60),
