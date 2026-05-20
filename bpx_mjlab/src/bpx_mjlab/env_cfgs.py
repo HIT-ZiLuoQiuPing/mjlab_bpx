@@ -22,7 +22,6 @@ from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.terrains.config import ROUGH_TERRAINS_CFG
-from mjlab.utils.lab_api.math import euler_xyz_from_quat, wrap_to_pi
 
 from bpx_mjlab.bpx.bpx_constants import (
     BPX_ACTION_SCALE,
@@ -79,163 +78,6 @@ def _safe_set_asset_names(term, field_name: str, names: tuple[str, ...]) -> bool
 
     return False
 
-
-def _safe_pop_term(term_dict, key: str) -> None:
-    if term_dict is not None and key in term_dict:
-        term_dict.pop(key, None)
-
-# 下面几个 reward term 直接在 cfg 里写函数比较麻烦，单独写成函数放这里。
-
-# 函数作用： 根据命令和当前速度计算一个奖励，鼓励机器人更精确地跟踪命令的速度，尤其是在较低速度下。
-def _bpx_track_forward_velocity(
-    env,
-    command_name: str,
-    std: float,
-) -> torch.Tensor:
-    asset = env.scene["robot"]
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    error = command[:, 0] - asset.data.root_link_lin_vel_b[:, 0]
-    return torch.exp(-(error.square()) / std**2)
-
-# 鼓励机器人跟踪横向速度命令，减少横向漂移。
-def _bpx_track_lateral_velocity(
-    env,
-    command_name: str,
-    std: float,
-) -> torch.Tensor:
-    asset = env.scene["robot"]
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    error = command[:, 1] - asset.data.root_link_lin_vel_b[:, 1]
-    return torch.exp(-(error.square()) / std**2)
-
-# 鼓励机器人跟踪旋转速度命令，减少转向误差。
-def _bpx_track_yaw_velocity(
-    env,
-    command_name: str,
-    std: float,
-) -> torch.Tensor:
-    asset = env.scene["robot"]
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    error = command[:, 2] - asset.data.root_link_ang_vel_b[:, 2]
-    return torch.exp(-(error.square()) / std**2)
-
-
-def _bpx_straight_command_mask(
-    command: torch.Tensor,
-    min_forward_command: float,
-    lateral_command_threshold: float,
-    yaw_command_threshold: float,
-) -> torch.Tensor:
-    return (
-        (command[:, 0] > min_forward_command)
-        & (torch.abs(command[:, 1]) < lateral_command_threshold)
-        & (torch.abs(command[:, 2]) < yaw_command_threshold)
-    )
-
-# 当机器人有明显的前向速度但命令要求它直行时，惩罚它的横向速度，鼓励它减少漂移。
-def _bpx_forward_lateral_drift(
-    env,
-    command_name: str,
-    min_forward_command: float = 0.2,
-    lateral_command_threshold: float = 0.05,
-    yaw_command_threshold: float = 0.05,
-) -> torch.Tensor:
-    asset = env.scene["robot"]
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    straight = _bpx_straight_command_mask(
-        command,
-        min_forward_command,
-        lateral_command_threshold,
-        yaw_command_threshold,
-    )
-    lateral_velocity = asset.data.root_link_lin_vel_b[:, 1]
-    return lateral_velocity.square() * straight.float()
-
-# 当机器人有明显的前向速度但命令要求它直行时，惩罚它的偏航速度，鼓励它减少转向漂移。
-def _bpx_forward_yaw_drift(
-    env,
-    command_name: str,
-    min_forward_command: float = 0.2,
-    lateral_command_threshold: float = 0.05,
-    yaw_command_threshold: float = 0.05,
-) -> torch.Tensor:
-    asset = env.scene["robot"]
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    straight = _bpx_straight_command_mask(
-        command,
-        min_forward_command,
-        lateral_command_threshold,
-        yaw_command_threshold,
-    )
-    yaw_velocity = asset.data.root_link_ang_vel_b[:, 2]
-    return yaw_velocity.square() * straight.float()
-
-
-class _BpxForwardLateralPositionDrift:
-    def __init__(self, cfg: RewardTermCfg, env):
-        self._env = env
-        self._initial_y = torch.zeros(env.num_envs, device=env.device)
-
-    def reset(self, env_ids: torch.Tensor) -> None:
-        asset = self._env.scene["robot"]
-        self._initial_y[env_ids] = asset.data.root_link_pos_w[env_ids, 1]
-
-    def __call__(
-        self,
-        env,
-        command_name: str,
-        min_forward_command: float = 0.2,
-        lateral_command_threshold: float = 0.08,
-        yaw_command_threshold: float = 0.08,
-    ) -> torch.Tensor:
-        asset = env.scene["robot"]
-        command = env.command_manager.get_command(command_name)
-        assert command is not None, f"Command '{command_name}' not found."
-        straight = _bpx_straight_command_mask(
-            command,
-            min_forward_command,
-            lateral_command_threshold,
-            yaw_command_threshold,
-        )
-        lateral_offset = asset.data.root_link_pos_w[:, 1] - self._initial_y
-        return lateral_offset.square() * straight.float()
-
-
-class _BpxForwardHeadingDrift:
-    def __init__(self, cfg: RewardTermCfg, env):
-        self._env = env
-        self._initial_yaw = torch.zeros(env.num_envs, device=env.device)
-
-    def reset(self, env_ids: torch.Tensor) -> None:
-        asset = self._env.scene["robot"]
-        _, _, yaw = euler_xyz_from_quat(asset.data.root_link_quat_w)
-        self._initial_yaw[env_ids] = yaw[env_ids]
-
-    def __call__(
-        self,
-        env,
-        command_name: str,
-        min_forward_command: float = 0.2,
-        lateral_command_threshold: float = 0.08,
-        yaw_command_threshold: float = 0.08,
-    ) -> torch.Tensor:
-        asset = env.scene["robot"]
-        command = env.command_manager.get_command(command_name)
-        assert command is not None, f"Command '{command_name}' not found."
-        straight = _bpx_straight_command_mask(
-            command,
-            min_forward_command,
-            lateral_command_threshold,
-            yaw_command_threshold,
-        )
-        _, _, yaw = euler_xyz_from_quat(asset.data.root_link_quat_w)
-        heading_error = wrap_to_pi(yaw - self._initial_yaw)
-        return heading_error.square() * straight.float()
 
 # 根据机器人与环境原点的距离以及命令的速度，动态调整地形难度等级，鼓励机器人逐渐适应更复杂的地形，同时避免过早或过快地增加难度。
 def _bpx_terrain_levels_vel(
@@ -551,35 +393,37 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     # 地形配置：使用生成器生成崎岖地形，配置不同类型地形的比例，并调整一些特定地形的参数，以提供多样化的训练环境，帮助机器人学习在不同崎岖地形上的速度跟踪能力。
     assert cfg.scene.terrain is not None # 确认地形配置存在。
-    cfg.scene.terrain.terrain_type = "generator" # 设置地形类型为生成器。
+    cfg.scene.terrain.terrain_type = "generator" # 设置地形类型为生成器。地形不是固定一个平面，而是由程序生成不同类型的地形。
     terrain_generator = deepcopy(ROUGH_TERRAINS_CFG) # 复制一份崎岖地形配置
-    terrain_generator.curriculum = True
-    terrain_proportions = {
+    terrain_generator.curriculum = True # 启用地形课程学习。
+    terrain_proportions = { 
         "flat": 0.12,
-        "pyramid_stairs": 0.14,
-        "pyramid_stairs_inv": 0.08,
+        "pyramid_stairs": 0.16,
+        "pyramid_stairs_inv": 0.10,
         "hf_pyramid_slope": 0.24,
-        "hf_pyramid_slope_inv": 0.26,
+        "hf_pyramid_slope_inv": 0.23,
         "random_rough": 0.08,
-        "wave_terrain": 0.08,
+        "wave_terrain": 0.07,
     }
+    #底下这些修改一些地形的参数，都是 safe 的，不存在就跳过，不会报错。
     for terrain_name, proportion in terrain_proportions.items():
         if terrain_name in terrain_generator.sub_terrains:
-            terrain_generator.sub_terrains[terrain_name].proportion = proportion
+            terrain_generator.sub_terrains[terrain_name].proportion = proportion # 如果地形生成器里确实有这种地形：就把它的生成比例设置成指定值。这样可以避免某些地形名字不存在时报错。
     for terrain_name in ("pyramid_stairs", "pyramid_stairs_inv"):
         if terrain_name in terrain_generator.sub_terrains:
             stairs_cfg = terrain_generator.sub_terrains[terrain_name]
             stairs_cfg.step_width = 0.35
-            stairs_cfg.step_height_range = (0.0, 0.08)
+            stairs_cfg.step_height_range = (0.04, 0.16)
     for terrain_name in ("hf_pyramid_slope", "hf_pyramid_slope_inv"):
         if terrain_name in terrain_generator.sub_terrains:
             terrain_generator.sub_terrains[terrain_name].slope_range = (0.0, 0.85)
-    cfg.scene.terrain.terrain_generator = terrain_generator
-    cfg.scene.terrain.max_init_terrain_level = 1
-    cfg.scene.extent = 3.0
+    cfg.scene.terrain.terrain_generator = terrain_generator # 把配置好的崎岖地形生成器写回环境配置。
+    cfg.scene.terrain.max_init_terrain_level = 1 # 刚开始先限制最大地形等级，避免一开始就生成太难的地形块。
+    cfg.scene.extent = 3.0 # 环境范围适当扩大一些，以适应崎岖地形可能需要更多的空间来生成不同的地形块。
 
+    # 传感器配置：添加脚部接触传感器和非脚部碰地传感器，以便在崎岖地形上更好地感知与地面的交互，同时删除默认的 raycast 传感器，因为它们可能不适合崎岖地形的训练需求。
     for sensor in cfg.scene.sensors or ():
-        if sensor.name == "terrain_scan":
+        if sensor.name == "terrain_scan": # 地形传感器 
             assert isinstance(sensor, RayCastSensorCfg)
             assert isinstance(sensor.frame, ObjRef)
             sensor.frame.name = "torso"
@@ -638,24 +482,27 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         dangerous_ground_cfg,
     )
 
-    joint_pos_action = cfg.actions["joint_pos"]
-    assert isinstance(joint_pos_action, JointPositionActionCfg)
-    joint_pos_action.scale = BPX_ACTION_SCALE
+    # 动作配置：保持使用关节位置控制，但调整动作缩放以适应 BPX 机器人的运动范围和崎岖地形上的控制需求。
+    joint_pos_action = cfg.actions["joint_pos"] # 继续使用关节位置控制，因为它通常更适合复杂地形上的精细控制，同时调整动作缩放因子。
+    assert isinstance(joint_pos_action, JointPositionActionCfg) # 确认这个动作项确实是关节位置动作配置
+    joint_pos_action.scale = BPX_ACTION_SCALE # 设置动作缩放
 
+    # 随机事件配置：事件通常用于 domain randomization，也就是训练时随机改变物理参数，让机器人更鲁棒。
     if "foot_friction" in cfg.events:
         _safe_set_asset_names(
             cfg.events["foot_friction"],
             "geom_names",
             FOOT_GEOMS,
-        )
+        )# 把默认事件里可能存在的 Go1/G1 的脚部几何体名字替换成 BPX 的脚部几何体名字，确保这个事件能正确地作用在 BPX 机器人的脚部。
     if "base_com" in cfg.events:
         _safe_set_asset_names(
             cfg.events["base_com"],
             "body_names",
             ("torso",),
-        )
+        )# 把默认事件里可能存在的 Go1/G1 的躯干名字替换成 BPX 的躯干名字，确保这个事件能正确地作用在 BPX 机器人的躯干。
 
-    if "pose" in cfg.rewards:
+    # 姿态奖励配置：调整姿态奖励的标准差参数，使其适应 BPX 机器人的运动范围和崎岖地形上的控制需求，鼓励机器人在不同运动状态下保持合适的姿态，同时允许一定的灵活性以适应复杂地形。
+    if "pose" in cfg.rewards:# 调整姿态奖励的标准差参数，使其适应 BPX 机器人的运动范围和崎岖地形上的控制需求。
         cfg.rewards["pose"].params["std_standing"] = {
             ".*_hip_roll_joint": 0.05,
             ".*_hip_pitch_joint": 0.10,
@@ -664,14 +511,14 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         cfg.rewards["pose"].params["std_walking"] = {
             ".*_hip_roll_joint": 0.30,
             ".*_hip_pitch_joint": 0.30,
-            ".*_knee_joint": 0.60,
+            ".*_knee_joint": 0.60, # 站立时膝盖比较笔直，走路时膝盖可以弯曲一些，跑步时膝盖可以弯曲更多，所以 std_running 比 std_walking 要大一些。
         }
         cfg.rewards["pose"].params["std_running"] = {
-            ".*_hip_roll_joint": 0.35,
-            ".*_hip_pitch_joint": 0.35,
-            ".*_knee_joint": 0.70,
+            ".*_hip_roll_joint": 0.30,
+            ".*_hip_pitch_joint": 0.30,
+            ".*_knee_joint": 0.60,
         }
-    if "upright" in cfg.rewards:
+    if "upright" in cfg.rewards: # 把默认奖励里可能存在的 Go1/G1 的躯干名字替换成 BPX 的躯干名字，确保这个奖励能正确地作用在 BPX 机器人的躯干。
         _safe_set_asset_names(cfg.rewards["upright"], "body_names", ("torso",))
         cfg.rewards["upright"].params["terrain_sensor_names"] = ("terrain_scan",)
     if "body_ang_vel" in cfg.rewards:
@@ -681,93 +528,53 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             _safe_set_asset_names(cfg.rewards[reward_name], "site_names", FOOT_SITES)
 
     if "track_linear_velocity" in cfg.rewards:
-        cfg.rewards["track_linear_velocity"].weight = 3.5
-        cfg.rewards["track_linear_velocity"].params["std"] = 0.35
+        cfg.rewards["track_linear_velocity"].weight = 2.0
+        cfg.rewards["track_linear_velocity"].params["std"] = 0.5
     if "track_angular_velocity" in cfg.rewards:
-        cfg.rewards["track_angular_velocity"].weight = 4.0
-        cfg.rewards["track_angular_velocity"].params["std"] = 0.28
-    cfg.rewards["track_forward_velocity_fine"] = RewardTermCfg(
-        func=_bpx_track_forward_velocity,
-        weight=1.4,
-        params={"command_name": "twist", "std": 0.25},
-    )
-    cfg.rewards["track_lateral_velocity_fine"] = RewardTermCfg(
-        func=_bpx_track_lateral_velocity,
-        weight=2.0,
-        params={"command_name": "twist", "std": 0.10},
-    )
-    cfg.rewards["track_yaw_velocity_fine"] = RewardTermCfg(
-        func=_bpx_track_yaw_velocity,
-        weight=2.2,
-        params={"command_name": "twist", "std": 0.18},
-    )
-    cfg.rewards["forward_lateral_drift"] = RewardTermCfg(
-        func=_bpx_forward_lateral_drift,
-        weight=-5.0,
-        params={
-            "command_name": "twist",
-            "lateral_command_threshold": 0.08,
-            "yaw_command_threshold": 0.08,
-        },
-    )
-    cfg.rewards["forward_yaw_drift"] = RewardTermCfg(
-        func=_bpx_forward_yaw_drift,
-        weight=-3.0,
-        params={
-            "command_name": "twist",
-            "lateral_command_threshold": 0.08,
-            "yaw_command_threshold": 0.08,
-        },
-    )
-    cfg.rewards["forward_lateral_position_drift"] = RewardTermCfg(
-        func=_BpxForwardLateralPositionDrift,
-        weight=-0.4,
-        params={"command_name": "twist"},
-    )
-    cfg.rewards["forward_heading_drift"] = RewardTermCfg(
-        func=_BpxForwardHeadingDrift,
-        weight=-1.5,
-        params={"command_name": "twist"},
-    )
+        cfg.rewards["track_angular_velocity"].weight = 2.0
+        cfg.rewards["track_angular_velocity"].params["std"] = 2**0.5 / 2
     if "body_ang_vel" in cfg.rewards:
-        cfg.rewards["body_ang_vel"].weight = -0.08
+        cfg.rewards["body_ang_vel"].weight = 0.0
     if "angular_momentum" in cfg.rewards:
         cfg.rewards["angular_momentum"].weight = 0.0
     if "action_rate_l2" in cfg.rewards:
-        cfg.rewards["action_rate_l2"].weight = -0.14
+        cfg.rewards["action_rate_l2"].weight = -0.1
     if "air_time" in cfg.rewards:
-        cfg.rewards["air_time"].weight = 0.25
+        cfg.rewards["air_time"].weight = 0.0
     if "foot_clearance" in cfg.rewards:
-        cfg.rewards["foot_clearance"].weight = -2.5
-        cfg.rewards["foot_clearance"].params["target_height"] = 0.14
+        cfg.rewards["foot_clearance"].weight = 0.0
+        cfg.rewards["foot_clearance"].params["target_height"] = 0.12
     if "foot_swing_height" in cfg.rewards:
-        cfg.rewards["foot_swing_height"].weight = -0.35
-        cfg.rewards["foot_swing_height"].params["target_height"] = 0.14
+        cfg.rewards["foot_swing_height"].weight = 0.0
+        cfg.rewards["foot_swing_height"].params["target_height"] = 0.12
     cfg.rewards["calf_ground_touch"] = RewardTermCfg(
         func=mdp.self_collision_cost,
         weight=-0.1,
         params={"sensor_name": calf_ground_cfg.name},
     )
-    cfg.rewards["termination"] = RewardTermCfg(
+    cfg.rewards["termination"] = RewardTermCfg( # 终止惩罚，摔倒了就给个大负奖励。
         func=mdp.is_terminated,
         weight=-25.0,
     )
 
+    # 终止条件配置：添加一个新的终止条件，当机器人与地面发生非法接触时（即非脚部接触），就终止 episode，以鼓励机器人避免摔倒或与地面发生不安全的接触。
     cfg.terminations["illegal_contact"] = TerminationTermCfg(
         func=mdp.illegal_contact,
         params={"sensor_name": dangerous_ground_cfg.name},
     )
 
+    # 命令空间配置
     cmd = cfg.commands["twist"]
-    assert isinstance(cmd, UniformVelocityCommandCfg)
+    assert isinstance(cmd, UniformVelocityCommandCfg) # 均匀采样速度命令配置
     cmd.viz.z_offset = 0.5
-    cmd.ranges.lin_vel_x = (-0.20, 0.75)
-    cmd.ranges.lin_vel_y = (-0.04, 0.04)
-    cmd.ranges.ang_vel_z = (-0.08, 0.08)
-    cmd.rel_standing_envs = 0.02
-    cmd.rel_forward_envs = 0.90
-    cmd.resampling_time_range = (6.0, 10.0)
+    cmd.ranges.lin_vel_x = (-0.40, 0.90) # 前向速度范围，保持和 curriculum manager 里设置的初始范围一致，后续会逐步放宽。
+    cmd.ranges.lin_vel_y = (-0.30, 0.30) # 侧向速度从早期就保留足够覆盖，否则策略容易把横向误差当成扰动而不是控制目标。
+    cmd.ranges.ang_vel_z = (-0.40, 0.40) # yaw 命令从早期就参与训练，避免后期才学习转向导致直行 yaw 偏移修不回来。
+    cmd.rel_standing_envs = 0.05 # 约 5% 的环境是站立命令，也就是机器人被要求不动。
+    cmd.rel_forward_envs = 0.35  # 降低纯前向命令占比，让策略像 PPO 平地任务一样充分学习横向和 yaw 跟踪。
+    cmd.resampling_time_range = (3.0, 8.0) # 与 PPO 平地任务保持一致，避免长时间固定命令把偏航漂移固化成习惯。
 
+    # 地形课程学习配置：设置一个基于机器人与环境原点距离的地形课程学习机制，根据训练进度动态调整允许的最大地形等级，同时确保只有在机器人坚持跑完整局并且走得够远的情况下才允许升级地形，避免过早引入高难度地形，同时也提供了降级机制以防止机器人被卡住或根本没动起来。
     cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
         func=_bpx_terrain_levels_vel,
         params={
@@ -785,6 +592,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             ),
         },
     )
+    # 命令速度课程学习
     cfg.curriculum["command_vel"] = CurriculumTermCfg(
         func=mdp.commands_vel,
         params={
@@ -792,113 +600,111 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "velocity_stages": [
                 {
                     "step": 0,
-                    "lin_vel_x": (-0.20, 0.75),
-                    "lin_vel_y": (-0.04, 0.04),
-                    "ang_vel_z": (-0.08, 0.08),
+                    "lin_vel_x": (-0.40, 0.90),
+                    "lin_vel_y": (-0.30, 0.30),
+                    "ang_vel_z": (-0.40, 0.40),
                 },
                 {
                     "step": 6000 * 16,
-                    "lin_vel_x": (-0.25, 0.85),
-                    "lin_vel_y": (-0.05, 0.05),
-                    "ang_vel_z": (-0.10, 0.10),
+                    "lin_vel_x": (-0.50, 1.00),
+                    "lin_vel_y": (-0.35, 0.35),
+                    "ang_vel_z": (-0.45, 0.45),
                 },
                 {
                     "step": 12000 * 16,
-                    "lin_vel_x": (-0.30, 1.05),
-                    "lin_vel_y": (-0.06, 0.06),
-                    "ang_vel_z": (-0.12, 0.12),
-                },
-                {
-                    "step": 20000 * 16,
-                    "lin_vel_x": (-0.45, 1.25),
-                    "lin_vel_y": (-0.08, 0.08),
-                    "ang_vel_z": (-0.16, 0.16),
-                },
-                {
-                    "step": 30000 * 16,
-                    "lin_vel_x": (-0.45, 1.45),
-                    "lin_vel_y": (-0.10, 0.10),
-                    "ang_vel_z": (-0.20, 0.20),
-                },
-                {
-                    "step": 38000 * 16,
-                    "lin_vel_x": (-0.50, 1.60),
-                    "lin_vel_y": (-0.16, 0.16),
-                    "ang_vel_z": (-0.35, 0.35),
-                },
-                {
-                    "step": 45000 * 16,
-                    "lin_vel_x": (-0.55, 1.80),
-                    "lin_vel_y": (-0.24, 0.24),
+                    "lin_vel_x": (-0.60, 1.10),
+                    "lin_vel_y": (-0.45, 0.45),
                     "ang_vel_z": (-0.50, 0.50),
                 },
                 {
-                    "step": 48000 * 16,
-                    "lin_vel_x": (-0.55, 1.80),
-                    "lin_vel_y": (-0.30, 0.30),
+                    "step": 20000 * 16,
+                    "lin_vel_x": (-0.80, 1.30),
+                    "lin_vel_y": (-0.55, 0.55),
+                    "ang_vel_z": (-0.55, 0.55),
+                },
+                {
+                    "step": 30000 * 16,
+                    "lin_vel_x": (-1.00, 1.50),
+                    "lin_vel_y": (-0.70, 0.70),
                     "ang_vel_z": (-0.60, 0.60),
+                },
+                {
+                    "step": 40000 * 16,
+                    "lin_vel_x": (-1.00, 1.80),
+                    "lin_vel_y": (-0.80, 0.80),
+                    "ang_vel_z": (-0.70, 0.70),
+                },
+                {
+                    "step": 46000 * 16,
+                    "lin_vel_x": (-1.00, 1.80),
+                    "lin_vel_y": (-1.00, 1.00),
+                    "ang_vel_z": (-0.70, 0.70),
                 },
             ],
         },
     )
 
-    base_actor_terms = cfg.observations["actor"].terms
-    base_critic_terms = cfg.observations["critic"].terms
+    #观察空间配置：根据 BPX 机器人的传感器配置和崎岖地形的训练需求，重新定义 actor 和 critic 的观察空间，确保它们包含足够的信息来支持在崎岖地形上学习速度跟踪能力，同时考虑到 play 模式下的特殊需求（比如去掉一些容易干扰的观测项）。
+    base_actor_terms = cfg.observations["actor"].terms # 取出原始 actor 观察项。actor 就是策略网络，负责根据观察输出动作。
+    base_critic_terms = cfg.observations["critic"].terms # 取出原始 critic 观察项。critic 就是价值网络，负责根据观察输出状态值或者优势函数。
+    #定义actor能看到的内容
     actor_term_names = (
-        "base_ang_vel",
-        "projected_gravity",
-        "joint_pos",
-        "joint_vel",
-        "actions",
-        "command",
+        "base_ang_vel", # 机身角速度。机器人可以感知自己是否在晃、在转。
+        "projected_gravity", # 投影到机身坐标系下的重力向量。机器人可以感知自己当前的姿态，比如是站着、趴着还是侧躺。
+        "joint_pos", # 关节位置。机器人可以感知自己当前的关节配置，比如腿是弯曲还是伸直。
+        "joint_vel", # 关节速度。机器人可以感知自己关节的运动状态，比如腿是在抬起还是放下。
+        "actions", # 上一步的动作。机器人可以感知自己上一步的动作输入，帮助它了解自己的运动趋势和惯性。这能帮助策略输出更连续的动作。
+        "command", # 当前的速度命令。机器人可以感知自己被要求达到什么样的速度，帮助它根据命令调整自己的运动。
     )
+    # 定义 critic 的特权观察
     privileged_term_names = (
-        "base_lin_vel",
-        "height_scan",
-        "foot_height",
-        "foot_air_time",
-        "foot_contact",
-        "foot_contact_forces",
+        "base_lin_vel", # 机身线速度。真实机器人上这个值可能不容易直接准确获得，所以不给 actor，但训练时可以给 critic。
+        "height_scan", # 地形高度扫描。崎岖地形上地面高低不平，知道前方地形的高度信息对评估状态很有帮助，但这个信息可能不太现实，所以只给 critic。
+        "foot_height", # 脚部高度。知道脚离地面的高度对评估状态也很有帮助，但这个信息可能不太现实，所以只给 critic。
+        "foot_air_time", # 脚部离地时间。知道脚部离地的时间对评估状态也很有帮助，但这个信息可能不太现实，所以只给 critic。
+        "foot_contact", # 脚部接触地面。知道脚部是否接触地面对评估状态也很有帮助，但这个信息可能不太现实，所以只给 critic。
+        "foot_contact_forces", # 脚部接触力。知道脚部接触地面时的力对评估状态也很有帮助，但这个信息可能不太现实，所以只给 critic。
     )
 
-    actor_terms = {
+    actor_terms = { # 构造 actor 观察字典
         name: deepcopy(base_actor_terms[name])
         for name in actor_term_names
     }
-    critic_terms = {
+    critic_terms = { # 构造 critic 观察字典，包含 actor 的观察项 + 特权观察项，因为 critic 可以看到更多的信息来更准确地评估状态，但 actor 只能看到有限的信息来输出动作。
         name: deepcopy(base_critic_terms[name])
         for name in (*actor_term_names, *privileged_term_names)
     }
-    estimator_target_terms = {
-        "base_lin_vel": deepcopy(base_critic_terms["base_lin_vel"]),
-        "height_scan": deepcopy(base_critic_terms["height_scan"]),
+    estimator_target_terms = { # 定义估计器目标。这可能用于辅助学习，比如让网络从历史观察中估计真实线速度和地形高度。
+        "base_lin_vel": deepcopy(base_critic_terms["base_lin_vel"]), # 真实线速度，critic 可以看到，actor 看不到，估计器目标里也包含，让网络学会从历史观察中估计这个值。
+        "height_scan": deepcopy(base_critic_terms["height_scan"]), # 地形高度扫描，critic 可以看到，actor 看不到，估计器目标里也包含，让网络学会从历史观察中估计这个值。
     }
 
+    # 用新的观察配置替换原来的观察配置。
     cfg.observations = {
         "actor": ObservationGroupCfg(
-            terms=actor_terms,
-            concatenate_terms=True,
-            enable_corruption=not play,
-            nan_policy="sanitize",
+            terms=actor_terms, # 使用前面定义的 actor_terms。
+            concatenate_terms=True, # 把多个观察项拼接成一个向量。策略网络通常需要一个扁平向量输入。
+            enable_corruption=not play, # 训练时启用观测噪声，测试时关闭
+            nan_policy="sanitize", # 如果观察里出现 NaN，就进行清理。
         ),
         "actor_history": ObservationGroupCfg(
             terms=deepcopy(actor_terms),
             concatenate_terms=True,
             enable_corruption=not play,
-            history_length=15,
-            flatten_history_dim=True,
+            history_length=15, # 保留最近 15 帧历史。这很重要，因为单帧观察可能不足以判断速度、运动趋势和接触状态。
+            flatten_history_dim=True, #把历史维度压平成一个长向量
             nan_policy="sanitize",
         ),
         "critic": ObservationGroupCfg(
             terms=critic_terms,
             concatenate_terms=True,
-            enable_corruption=False,
+            enable_corruption=False, # critic 的观察不加噪声，因为它主要用于评估状态值，过多的噪声可能会干扰训练稳定性。
             nan_policy="sanitize",
         ),
         "estimator_target": ObservationGroupCfg(
-            terms=estimator_target_terms,
+            terms=estimator_target_terms, # 估计器目标观察项，主要用于辅助学习，让网络学会从历史观察中估计一些关键的状态信息。
             concatenate_terms=True,
-            enable_corruption=False,
+            enable_corruption=False, # 估计器目标的观察不加噪声，因为它们是用来训练网络去估计的，如果这些目标本身就有噪声，可能会干扰训练。
             nan_policy="sanitize",
         ),
     }
@@ -906,5 +712,9 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     if play:
         cfg.episode_length_s = int(1e9)
         cfg.events.pop("push_robot", None)
+        cmd.ranges.lin_vel_x = (-0.55, 1.80)
+        cmd.ranges.lin_vel_y = (-0.30, 0.30)
+        cmd.ranges.ang_vel_z = (-0.60, 0.60)
+        cfg.curriculum.pop("command_vel", None)
 
     return cfg
