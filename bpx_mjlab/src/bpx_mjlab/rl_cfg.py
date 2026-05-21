@@ -13,8 +13,8 @@ class DreamWaqAlgorithmCfg(RslRlPpoAlgorithmCfg):
     latent_dim: int = 24
     encoder_hidden_dims: tuple[int, ...] = (512, 256)
     decoder_hidden_dims: tuple[int, ...] = (256, 512)
-    velocity_loss_coef: float = 1.0
-    terrain_loss_coef: float = 0.2
+    velocity_loss_coef: float = 2.0
+    terrain_loss_coef: float = 0.5
     kl_loss_coef: float = 1.0e-3
 
 
@@ -66,7 +66,7 @@ def bpx_waq_runner_cfg() -> RslRlOnPolicyRunnerCfg:
             num_learning_epochs=5,
             num_mini_batches=4,
             learning_rate=1.0e-3,
-            entropy_coef=0.01,
+            entropy_coef=0.005,
             desired_kl=0.01,
         ),
         experiment_name="bpx_waq_rough",

@@ -10,8 +10,8 @@ from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable
 from tensordict import TensorDict
 
-
-def _obs_dim(obs: TensorDict, groups: tuple[str, ...] | list[str]) -> int:
+# 注释：DreamWaQ模型实现，包含CENet编码器和DreamWaqActor策略网络。
+def _obs_dim(obs: TensorDict, groups: tuple[str, ...] | list[str]) -> int: # 计算指定观察组的总维度，确保每个组都是1D的。
     dim = 0
     for group in groups:
         if len(obs[group].shape) != 2:
@@ -22,7 +22,7 @@ def _obs_dim(obs: TensorDict, groups: tuple[str, ...] | list[str]) -> int:
     return dim
 
 
-def _concat_obs(obs: TensorDict, groups: tuple[str, ...] | list[str]) -> torch.Tensor:
+def _concat_obs(obs: TensorDict, groups: tuple[str, ...] | list[str]) -> torch.Tensor: # 将指定观察组的张量沿最后一个维度连接起来，形成一个大的输入张量。
     return torch.cat([obs[group] for group in groups], dim=-1)
 
 
@@ -41,7 +41,7 @@ class CENet(nn.Module):
         self.latent_dim = latent_dim
         self.encoder = MLP(
             input_dim=input_dim,
-            output_dim=3 + 2 * latent_dim,
+            output_dim=3 + 2 * latent_dim, # 输出维度包括3维速度和VAE 隐变量均值 和VAE 隐变量 log 方差
             hidden_dims=hidden_dims,
             activation=activation,
         )
