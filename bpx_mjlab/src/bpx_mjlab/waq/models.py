@@ -65,7 +65,7 @@ class CENet(nn.Module):
         if self.decoder is None:
             terrain = history.new_zeros((*history.shape[:-1], 0))
         else:
-            terrain = self.decoder(z)
+            terrain = self.decoder(z) # 试图从隐变量 z 中重构某些地形/环境特权信息。
         return {
             "vel": vel,
             "z": z,
@@ -95,9 +95,9 @@ class DreamWaqActor(nn.Module):
         if distribution_cfg is None:
             raise ValueError("DreamWaqActor requires a stochastic distribution_cfg.")
 
-        self.actor_groups = tuple(obs_groups["actor"])
-        self.history_groups = tuple(obs_groups["actor_history"])
-        self.estimator_target_groups = tuple(obs_groups["estimator_target"])
+        self.actor_groups = tuple(obs_groups["actor"]) # 当前策略观测，例如角速度、重力方向、关节角、关节速度、上一动作等
+        self.history_groups = tuple(obs_groups["actor_history"]) # 历史观测，用来给 CENet 估计速度和隐变量
+        self.estimator_target_groups = tuple(obs_groups["estimator_target"]) # CENet 的监督目标，前 3 维是 base velocity，后面是 terrain 信息
 
         self.actor_obs_dim = _obs_dim(obs, self.actor_groups)
         self.history_obs_dim = _obs_dim(obs, self.history_groups)

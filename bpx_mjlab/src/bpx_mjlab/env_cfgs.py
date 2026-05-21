@@ -158,6 +158,40 @@ def _bpx_forward_yaw_drift(
     return yaw_velocity.square() * straight.float()
 
 
+def _bpx_leg_symmetry(
+    env,
+    command_name: str,
+    min_forward_command: float = 0.2,
+    lateral_command_threshold: float = 0.08,
+    yaw_command_threshold: float = 0.08,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    straight = (
+        (command[:, 0] > min_forward_command)
+        & (torch.abs(command[:, 1]) < lateral_command_threshold)
+        & (torch.abs(command[:, 2]) < yaw_command_threshold)
+    )
+
+    q = asset.data.joint_pos
+    front_roll = torch.square(q[:, 0] + q[:, 3])
+    hind_roll = torch.square(q[:, 6] + q[:, 9])
+    front_pitch = torch.square(q[:, 1] - q[:, 4])
+    hind_pitch = torch.square(q[:, 7] - q[:, 10])
+    front_knee = torch.square(q[:, 2] - q[:, 5])
+    hind_knee = torch.square(q[:, 8] - q[:, 11])
+    symmetry_cost = (
+        front_roll
+        + hind_roll
+        + front_pitch
+        + hind_pitch
+        + front_knee
+        + hind_knee
+    )
+    return symmetry_cost * straight.float()
+
+
 def _bpx_terrain_levels_vel(
     env,
     env_ids: torch.Tensor,
@@ -460,7 +494,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         if terrain_name in terrain_generator.sub_terrains:
             stairs_cfg = terrain_generator.sub_terrains[terrain_name]
             stairs_cfg.step_width = 0.35
-            stairs_cfg.step_height_range = (0.0, 0.08)
+            stairs_cfg.step_height_range = (0.04, 0.16)
     for terrain_name in ("hf_pyramid_slope", "hf_pyramid_slope_inv"):
         if terrain_name in terrain_generator.sub_terrains:
             terrain_generator.sub_terrains[terrain_name].slope_range = (0.0, 0.85)
@@ -574,8 +608,8 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         cfg.rewards["track_linear_velocity"].weight = 3.5
         cfg.rewards["track_linear_velocity"].params["std"] = 0.35
     if "track_angular_velocity" in cfg.rewards:
-        cfg.rewards["track_angular_velocity"].weight = 2.5
-        cfg.rewards["track_angular_velocity"].params["std"] = 0.45
+        cfg.rewards["track_angular_velocity"].weight = 3.2
+        cfg.rewards["track_angular_velocity"].params["std"] = 0.40
     cfg.rewards["track_forward_velocity_fine"] = RewardTermCfg(
         func=_bpx_track_forward_velocity,
         weight=1.4,
@@ -588,8 +622,8 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.rewards["track_yaw_velocity_fine"] = RewardTermCfg(
         func=_bpx_track_yaw_velocity,
-        weight=1.0,
-        params={"command_name": "twist", "std": 0.30},
+        weight=1.4,
+        params={"command_name": "twist", "std": 0.25},
     )
     cfg.rewards["forward_lateral_drift"] = RewardTermCfg(
         func=_bpx_forward_lateral_drift,
@@ -598,7 +632,12 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.rewards["forward_yaw_drift"] = RewardTermCfg(
         func=_bpx_forward_yaw_drift,
-        weight=-0.8,
+        weight=-1.2,
+        params={"command_name": "twist"},
+    )
+    cfg.rewards["leg_symmetry"] = RewardTermCfg(
+        func=_bpx_leg_symmetry,
+        weight=-0.25,
         params={"command_name": "twist"},
     )
     if "body_ang_vel" in cfg.rewards:
@@ -609,6 +648,10 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         cfg.rewards["action_rate_l2"].weight = -0.12
     if "air_time" in cfg.rewards:
         cfg.rewards["air_time"].weight = 0.2
+    if "foot_clearance" in cfg.rewards:
+        cfg.rewards["foot_clearance"].params["target_height"] = 0.12
+    if "foot_swing_height" in cfg.rewards:
+        cfg.rewards["foot_swing_height"].params["target_height"] = 0.12
     cfg.rewards["calf_ground_touch"] = RewardTermCfg(
         func=mdp.self_collision_cost,
         weight=-0.1,
