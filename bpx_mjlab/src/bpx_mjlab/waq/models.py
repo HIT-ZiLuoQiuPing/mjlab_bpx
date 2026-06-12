@@ -63,7 +63,7 @@ class CENet(nn.Module):
         z_logvar = torch.clamp(z_logvar, min=-10.0, max=4.0)
         z = z_mu
         if self.decoder is None:
-            terrain = history.new_zeros((*history.shape[:-1], 0))
+            terrain = history.new_zeros((history.shape[0], 0))
         else:
             terrain = self.decoder(z) # 试图从隐变量 z 中重构某些地形/环境特权信息。
         return {
@@ -234,8 +234,16 @@ class _ExportDreamWaqActorBase(nn.Module):
         self.deterministic_output = model.distribution.as_deterministic_output_module()
         self.actor_input_size = model.actor_obs_dim
         self.history_input_size = model.history_obs_dim
+        if self.history_input_size % self.actor_input_size != 0:
+            raise ValueError(
+                f"History dim {self.history_input_size} is not divisible by actor dim {self.actor_input_size}."
+            )
+        self.history_length = self.history_input_size // self.actor_input_size
 
     def forward(self, actor_obs: torch.Tensor, actor_history: torch.Tensor) -> torch.Tensor:
+        return self.forward_actor_history(actor_obs, actor_history)
+
+    def forward_actor_history(self, actor_obs: torch.Tensor, actor_history: torch.Tensor) -> torch.Tensor:
         actor_obs = self.actor_obs_normalizer(actor_obs)
         actor_history = self.history_obs_normalizer(actor_history)
         cenet_out = self.cenet(actor_history)
@@ -244,6 +252,42 @@ class _ExportDreamWaqActorBase(nn.Module):
 
 
 class _TorchDreamWaqActor(_ExportDreamWaqActorBase):
+    def __init__(self, model: DreamWaqActor) -> None:
+        super().__init__(model)
+        if self.actor_input_size != 45:
+            raise ValueError(
+                f"BPX sim2real TorchScript export expects a 45D actor frame, got {self.actor_input_size}."
+            )
+
+    def _frame_major_to_term_major(self, frame_history: torch.Tensor) -> torch.Tensor:
+        batch = frame_history.shape[0]
+        frames = frame_history.reshape(batch, self.history_length, self.actor_input_size)
+        base_ang_vel = frames[:, :, 0:3].reshape(batch, -1)
+        projected_gravity = frames[:, :, 3:6].reshape(batch, -1)
+        command = frames[:, :, 6:9].reshape(batch, -1)
+        joint_pos = frames[:, :, 9:21].reshape(batch, -1)
+        joint_vel = frames[:, :, 21:33].reshape(batch, -1)
+        last_action = frames[:, :, 33:45].reshape(batch, -1)
+        return torch.cat(
+            (base_ang_vel, projected_gravity, command, joint_pos, joint_vel, last_action),
+            dim=1,
+        )
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        input_dim = observations.size(-1)
+        if input_dim == self.history_input_size:
+            frame_history = observations
+            frames = frame_history.reshape(observations.shape[0], self.history_length, self.actor_input_size)
+            actor_obs = frames[:, self.history_length - 1, :]
+        elif input_dim == self.actor_input_size + self.history_input_size:
+            actor_obs = observations[:, : self.actor_input_size]
+            frame_history = observations[:, self.actor_input_size :]
+        else:
+            raise RuntimeError("Unexpected BPX sim2real policy input dimension.")
+
+        actor_history = self._frame_major_to_term_major(frame_history)
+        return self.forward_actor_history(actor_obs, actor_history)
+
     @torch.jit.export
     def reset(self) -> None:
         pass

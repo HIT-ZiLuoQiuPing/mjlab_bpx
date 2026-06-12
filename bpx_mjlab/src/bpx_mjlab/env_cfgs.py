@@ -7,6 +7,7 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 
 from mjlab.sensor import (
@@ -25,6 +26,7 @@ from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 
 from bpx_mjlab.bpx.bpx_constants import (
     BPX_ACTION_SCALE,
+    BPX_SIM2REAL_JOINT_ORDER,
     FOOT_GEOMS,
     FOOT_SITES,
     get_bpx_robot_cfg,
@@ -44,6 +46,46 @@ THIGH_GEOMS = tuple(
 )
 TORSO_GEOMS = ("torso_collision_0", "torso_collision_1", "torso_collision_2")
 DANGEROUS_GROUND_GEOMS = (*TORSO_GEOMS, *THIGH_GEOMS)
+
+
+def _bpx_action_scale_for_joint(joint_name: str) -> float:
+    if joint_name.endswith("_hip_roll_joint"):
+        return BPX_ACTION_SCALE[".*_hip_roll_joint"]
+    if joint_name.endswith("_hip_pitch_joint"):
+        return BPX_ACTION_SCALE[".*_hip_pitch_joint"]
+    if joint_name.endswith("_knee_joint"):
+        return BPX_ACTION_SCALE[".*_knee_joint"]
+    raise ValueError(f"Unsupported BPX action joint: {joint_name}")
+
+
+def _make_bpx_simreal_actions() -> dict[str, JointPositionActionCfg]:
+    return {
+        f"joint_pos_{idx:02d}_{joint_name}": JointPositionActionCfg(
+            entity_name="robot",
+            actuator_names=(joint_name,),
+            scale=_bpx_action_scale_for_joint(joint_name),
+            use_default_offset=True,
+        )
+        for idx, joint_name in enumerate(BPX_SIM2REAL_JOINT_ORDER)
+    }
+
+
+def _configure_bpx_simreal_actor_terms(actor_terms: dict) -> None:
+    joint_asset_cfg = SceneEntityCfg(
+        "robot",
+        joint_names=BPX_SIM2REAL_JOINT_ORDER,
+        preserve_order=True,
+    )
+
+    actor_terms["base_ang_vel"].scale = 0.25
+    actor_terms["command"].scale = (2.0, 2.0, 0.25)
+    actor_terms["joint_vel"].scale = 0.05
+
+    actor_terms["joint_pos"].params["asset_cfg"] = deepcopy(joint_asset_cfg)
+    actor_terms["joint_vel"].params["asset_cfg"] = deepcopy(joint_asset_cfg)
+
+    for term in actor_terms.values():
+        term.clip = (-100.0, 100.0)
 
 
 def _safe_set_asset_names(term, field_name: str, names: tuple[str, ...]) -> bool:
@@ -156,40 +198,6 @@ def _bpx_forward_yaw_drift(
     )
     yaw_velocity = asset.data.root_link_ang_vel_b[:, 2]
     return yaw_velocity.square() * straight.float()
-
-
-def _bpx_leg_symmetry(
-    env,
-    command_name: str,
-    min_forward_command: float = 0.2,
-    lateral_command_threshold: float = 0.08,
-    yaw_command_threshold: float = 0.08,
-) -> torch.Tensor:
-    asset = env.scene["robot"]
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    straight = (
-        (command[:, 0] > min_forward_command)
-        & (torch.abs(command[:, 1]) < lateral_command_threshold)
-        & (torch.abs(command[:, 2]) < yaw_command_threshold)
-    )
-
-    q = asset.data.joint_pos
-    front_roll = torch.square(q[:, 0] + q[:, 3])
-    hind_roll = torch.square(q[:, 6] + q[:, 9])
-    front_pitch = torch.square(q[:, 1] - q[:, 4])
-    hind_pitch = torch.square(q[:, 7] - q[:, 10])
-    front_knee = torch.square(q[:, 2] - q[:, 5])
-    hind_knee = torch.square(q[:, 8] - q[:, 11])
-    symmetry_cost = (
-        front_roll
-        + hind_roll
-        + front_pitch
-        + hind_pitch
-        + front_knee
-        + hind_knee
-    )
-    return symmetry_cost * straight.float()
 
 
 def _bpx_terrain_levels_vel(
@@ -365,10 +373,8 @@ def bpx_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         nonfoot_ground_cfg,
     )
 
-    # 动作：12 个关节的位置控制。
-    joint_pos_action = cfg.actions["joint_pos"]
-    assert isinstance(joint_pos_action, JointPositionActionCfg)
-    joint_pos_action.scale = BPX_ACTION_SCALE
+    # 动作顺序严格对齐部署侧 type-major policy contract。
+    cfg.actions = _make_bpx_simreal_actions()
 
     # 尝试把默认 Go1/G1 的 body/site/geom 名字替换成 BPX。
     # 这里全部 safe，不存在就跳过，避免任务注册失败。
@@ -562,9 +568,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         dangerous_ground_cfg,
     )
 
-    joint_pos_action = cfg.actions["joint_pos"]
-    assert isinstance(joint_pos_action, JointPositionActionCfg)
-    joint_pos_action.scale = BPX_ACTION_SCALE
+    cfg.actions = _make_bpx_simreal_actions()
 
     if "foot_friction" in cfg.events:
         _safe_set_asset_names(
@@ -633,11 +637,6 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["forward_yaw_drift"] = RewardTermCfg(
         func=_bpx_forward_yaw_drift,
         weight=-1.2,
-        params={"command_name": "twist"},
-    )
-    cfg.rewards["leg_symmetry"] = RewardTermCfg(
-        func=_bpx_leg_symmetry,
-        weight=-0.25,
         params={"command_name": "twist"},
     )
     if "body_ang_vel" in cfg.rewards:
@@ -741,10 +740,10 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     actor_term_names = (
         "base_ang_vel",
         "projected_gravity",
+        "command",
         "joint_pos",
         "joint_vel",
         "actions",
-        "command",
     )
     privileged_term_names = (
         "base_lin_vel",
@@ -759,10 +758,17 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         name: deepcopy(base_actor_terms[name])
         for name in actor_term_names
     }
+    _configure_bpx_simreal_actor_terms(actor_terms)
     critic_terms = {
-        name: deepcopy(base_critic_terms[name])
-        for name in (*actor_term_names, *privileged_term_names)
+        name: deepcopy(actor_terms[name])
+        for name in actor_term_names
     }
+    critic_terms.update(
+        {
+            name: deepcopy(base_critic_terms[name])
+            for name in privileged_term_names
+        }
+    )
     estimator_target_terms = {
         "base_lin_vel": deepcopy(base_critic_terms["base_lin_vel"]),
         "height_scan": deepcopy(base_critic_terms["height_scan"]),
@@ -779,7 +785,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             terms=deepcopy(actor_terms),
             concatenate_terms=True,
             enable_corruption=not play,
-            history_length=15,
+            history_length=5,
             flatten_history_dim=True,
             nan_policy="sanitize",
         ),
