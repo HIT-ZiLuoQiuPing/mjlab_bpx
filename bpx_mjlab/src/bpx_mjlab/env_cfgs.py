@@ -3,8 +3,10 @@ from copy import deepcopy
 import torch
 
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -126,78 +128,91 @@ def _safe_pop_term(term_dict, key: str) -> None:
         term_dict.pop(key, None)
 
 
-def _bpx_track_forward_velocity(
+def _bpx_raw_action_l2(env) -> torch.Tensor:
+    action = env.action_manager.action
+    env.extras["log"]["Metrics/bpx_raw_action_abs_mean"] = torch.mean(torch.abs(action))
+    env.extras["log"]["Metrics/bpx_raw_action_abs_max"] = torch.max(torch.abs(action))
+    return torch.sum(torch.square(action), dim=1)
+
+
+def _bpx_stand_still_action_l2(
     env,
     command_name: str,
-    std: float,
+    command_threshold: float = 0.08,
 ) -> torch.Tensor:
-    asset = env.scene["robot"]
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
-    error = command[:, 0] - asset.data.root_link_lin_vel_b[:, 0]
-    return torch.exp(-(error.square()) / std**2)
+    command_norm = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    standing = (command_norm < command_threshold).float()
+    return torch.sum(torch.square(env.action_manager.action), dim=1) * standing
 
 
-def _bpx_track_lateral_velocity(
+def _bpx_long_air_time_penalty(
     env,
+    sensor_name: str,
     command_name: str,
-    std: float,
+    max_air_time: float = 0.45,
+    command_threshold: float = 0.05,
 ) -> torch.Tensor:
-    asset = env.scene["robot"]
+    sensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time
+    assert air_time is not None
+
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
-    error = command[:, 1] - asset.data.root_link_lin_vel_b[:, 1]
-    return torch.exp(-(error.square()) / std**2)
+    command_norm = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    active = (command_norm > command_threshold).float()
+
+    excess = torch.clamp(air_time - max_air_time, min=0.0)
+    max_air_time_batch = torch.max(air_time, dim=1).values
+    env.extras["log"]["Metrics/bpx_max_air_time"] = torch.mean(max_air_time_batch)
+    env.extras["log"]["Metrics/bpx_long_air_excess"] = torch.mean(excess)
+    return torch.sum(excess.square(), dim=1) * active
 
 
-def _bpx_track_yaw_velocity(
+def _bpx_low_foot_contact_count_penalty(
     env,
+    sensor_name: str,
     command_name: str,
-    std: float,
+    min_contacts: float = 2.0,
+    command_threshold: float = 0.05,
 ) -> torch.Tensor:
-    asset = env.scene["robot"]
+    sensor = env.scene[sensor_name]
+    found = sensor.data.found
+    assert found is not None
+
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
-    error = command[:, 2] - asset.data.root_link_ang_vel_b[:, 2]
-    return torch.exp(-(error.square()) / std**2)
+    command_norm = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    active = (command_norm > command_threshold).float()
+
+    contact_count = torch.sum((found > 0).float(), dim=1)
+    env.extras["log"]["Metrics/bpx_foot_contact_count"] = torch.mean(contact_count)
+    return torch.square(torch.clamp(min_contacts - contact_count, min=0.0)) * active
 
 
-def _bpx_forward_lateral_drift(
+def _bpx_stand_still_foot_contact_count_penalty(
     env,
+    sensor_name: str,
     command_name: str,
-    min_forward_command: float = 0.2,
-    lateral_command_threshold: float = 0.05,
-    yaw_command_threshold: float = 0.05,
+    min_contacts: float = 4.0,
+    command_threshold: float = 0.08,
 ) -> torch.Tensor:
-    asset = env.scene["robot"]
+    sensor = env.scene[sensor_name]
+    found = sensor.data.found
+    assert found is not None
+
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
-    straight = (
-        (command[:, 0] > min_forward_command)
-        & (torch.abs(command[:, 1]) < lateral_command_threshold)
-        & (torch.abs(command[:, 2]) < yaw_command_threshold)
+    command_norm = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    standing = (command_norm < command_threshold).float()
+
+    contact_count = torch.sum((found > 0).float(), dim=1)
+    standing_ratio = torch.clamp(torch.mean(standing), min=1e-6)
+    env.extras["log"]["Metrics/bpx_stand_foot_contact_count"] = (
+        torch.mean(contact_count * standing) / standing_ratio
     )
-    lateral_velocity = asset.data.root_link_lin_vel_b[:, 1]
-    return lateral_velocity.square() * straight.float()
-
-
-def _bpx_forward_yaw_drift(
-    env,
-    command_name: str,
-    min_forward_command: float = 0.2,
-    lateral_command_threshold: float = 0.05,
-    yaw_command_threshold: float = 0.05,
-) -> torch.Tensor:
-    asset = env.scene["robot"]
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    straight = (
-        (command[:, 0] > min_forward_command)
-        & (torch.abs(command[:, 1]) < lateral_command_threshold)
-        & (torch.abs(command[:, 2]) < yaw_command_threshold)
-    )
-    yaw_velocity = asset.data.root_link_ang_vel_b[:, 2]
-    return yaw_velocity.square() * straight.float()
+    return torch.square(torch.clamp(min_contacts - contact_count, min=0.0)) * standing
 
 
 def _bpx_terrain_levels_vel(
@@ -576,11 +591,74 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "geom_names",
             FOOT_GEOMS,
         )
+        cfg.events["foot_friction"].params["shared_random"] = False
     if "base_com" in cfg.events:
         _safe_set_asset_names(
             cfg.events["base_com"],
             "body_names",
             ("torso",),
+        )
+    if "encoder_bias" in cfg.events:
+        cfg.events["encoder_bias"].params["bias_range"] = (-0.05, 0.05)
+    if "reset_robot_joints" in cfg.events:
+        cfg.events["reset_robot_joints"].params["position_range"] = (-0.10, 0.10)
+        cfg.events["reset_robot_joints"].params["velocity_range"] = (-0.08, 0.08)
+    if "push_robot" in cfg.events:
+        cfg.events["push_robot"].interval_range_s = (4.0, 7.0)
+        cfg.events["push_robot"].params["velocity_range"] = {
+            "x": (-0.20, 0.20),
+            "y": (-0.20, 0.20),
+            "z": (-0.10, 0.10),
+            "roll": (-0.20, 0.20),
+            "pitch": (-0.20, 0.20),
+            "yaw": (-0.30, 0.30),
+        }
+
+    if not play:
+        joint_randomization_cfg = SceneEntityCfg(
+            "robot",
+            joint_names=BPX_SIM2REAL_JOINT_ORDER,
+            preserve_order=True,
+        )
+        cfg.events["bpx_joint_damping"] = EventTermCfg(
+            mode="startup",
+            func=dr.joint_damping,
+            params={
+                "asset_cfg": deepcopy(joint_randomization_cfg),
+                "operation": "scale",
+                "ranges": (0.70, 1.40),
+                "shared_random": False,
+            },
+        )
+        cfg.events["bpx_joint_friction"] = EventTermCfg(
+            mode="startup",
+            func=dr.joint_friction,
+            params={
+                "asset_cfg": deepcopy(joint_randomization_cfg),
+                "operation": "abs",
+                "ranges": (0.0, 0.08),
+                "shared_random": False,
+            },
+        )
+        cfg.events["bpx_joint_armature"] = EventTermCfg(
+            mode="startup",
+            func=dr.joint_armature,
+            params={
+                "asset_cfg": deepcopy(joint_randomization_cfg),
+                "operation": "scale",
+                "ranges": (0.70, 1.50),
+                "shared_random": False,
+            },
+        )
+        cfg.events["bpx_pd_gains"] = EventTermCfg(
+            mode="startup",
+            func=dr.pd_gains,
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "operation": "scale",
+                "kp_range": (0.85, 1.15),
+                "kd_range": (0.80, 1.25),
+            },
         )
 
     if "pose" in cfg.rewards:
@@ -590,67 +668,88 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             ".*_knee_joint": 0.10,
         }
         cfg.rewards["pose"].params["std_walking"] = {
-            ".*_hip_roll_joint": 0.30,
-            ".*_hip_pitch_joint": 0.30,
-            ".*_knee_joint": 0.60,
+            ".*_hip_roll_joint": 0.22,
+            ".*_hip_pitch_joint": 0.25,
+            ".*_knee_joint": 0.45,
         }
         cfg.rewards["pose"].params["std_running"] = {
-            ".*_hip_roll_joint": 0.35,
-            ".*_hip_pitch_joint": 0.35,
-            ".*_knee_joint": 0.70,
+            ".*_hip_roll_joint": 0.28,
+            ".*_hip_pitch_joint": 0.30,
+            ".*_knee_joint": 0.55,
         }
     if "upright" in cfg.rewards:
         _safe_set_asset_names(cfg.rewards["upright"], "body_names", ("torso",))
         cfg.rewards["upright"].params["terrain_sensor_names"] = ("terrain_scan",)
     if "body_ang_vel" in cfg.rewards:
         _safe_set_asset_names(cfg.rewards["body_ang_vel"], "body_names", ("torso",))
-    for reward_name in ("foot_clearance", "foot_slip"):
+    for reward_name in ("foot_clearance", "foot_swing_height", "foot_slip"):
         if reward_name in cfg.rewards:
             _safe_set_asset_names(cfg.rewards[reward_name], "site_names", FOOT_SITES)
 
     if "track_linear_velocity" in cfg.rewards:
-        cfg.rewards["track_linear_velocity"].weight = 3.5
-        cfg.rewards["track_linear_velocity"].params["std"] = 0.35
+        cfg.rewards["track_linear_velocity"].weight = 2.8
+        cfg.rewards["track_linear_velocity"].params["std"] = 0.45
     if "track_angular_velocity" in cfg.rewards:
-        cfg.rewards["track_angular_velocity"].weight = 3.2
-        cfg.rewards["track_angular_velocity"].params["std"] = 0.40
-    cfg.rewards["track_forward_velocity_fine"] = RewardTermCfg(
-        func=_bpx_track_forward_velocity,
-        weight=1.4,
-        params={"command_name": "twist", "std": 0.25},
-    )
-    cfg.rewards["track_lateral_velocity_fine"] = RewardTermCfg(
-        func=_bpx_track_lateral_velocity,
-        weight=1.2,
-        params={"command_name": "twist", "std": 0.16},
-    )
-    cfg.rewards["track_yaw_velocity_fine"] = RewardTermCfg(
-        func=_bpx_track_yaw_velocity,
-        weight=1.4,
-        params={"command_name": "twist", "std": 0.25},
-    )
-    cfg.rewards["forward_lateral_drift"] = RewardTermCfg(
-        func=_bpx_forward_lateral_drift,
-        weight=-1.5,
-        params={"command_name": "twist"},
-    )
-    cfg.rewards["forward_yaw_drift"] = RewardTermCfg(
-        func=_bpx_forward_yaw_drift,
-        weight=-1.2,
-        params={"command_name": "twist"},
-    )
+        cfg.rewards["track_angular_velocity"].weight = 1.6
+        cfg.rewards["track_angular_velocity"].params["std"] = 0.55
     if "body_ang_vel" in cfg.rewards:
-        cfg.rewards["body_ang_vel"].weight = -0.05
+        cfg.rewards["body_ang_vel"].weight = -0.08
     if "angular_momentum" in cfg.rewards:
         cfg.rewards["angular_momentum"].weight = 0.0
     if "action_rate_l2" in cfg.rewards:
-        cfg.rewards["action_rate_l2"].weight = -0.12
+        cfg.rewards["action_rate_l2"].weight = -0.10
+    cfg.rewards["raw_action_l2"] = RewardTermCfg(
+        func=_bpx_raw_action_l2,
+        weight=-0.004,
+    )
+    cfg.rewards["stand_still_action_l2"] = RewardTermCfg(
+        func=_bpx_stand_still_action_l2,
+        weight=-0.04,
+        params={
+            "command_name": "twist",
+            "command_threshold": 0.08,
+        },
+    )
     if "air_time" in cfg.rewards:
-        cfg.rewards["air_time"].weight = 0.2
+        cfg.rewards["air_time"].weight = 0.0
     if "foot_clearance" in cfg.rewards:
-        cfg.rewards["foot_clearance"].params["target_height"] = 0.12
+        cfg.rewards["foot_clearance"].params["target_height"] = 0.08
+        cfg.rewards["foot_clearance"].weight = 0.0
     if "foot_swing_height" in cfg.rewards:
-        cfg.rewards["foot_swing_height"].params["target_height"] = 0.12
+        cfg.rewards["foot_swing_height"].params["target_height"] = 0.08
+        cfg.rewards["foot_swing_height"].weight = 0.0
+    if "foot_slip" in cfg.rewards:
+        cfg.rewards["foot_slip"].weight = -0.08
+    cfg.rewards["long_air_time"] = RewardTermCfg(
+        func=_bpx_long_air_time_penalty,
+        weight=-4.0,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "command_name": "twist",
+            "max_air_time": 0.35,
+            "command_threshold": 0.05,
+        },
+    )
+    cfg.rewards["low_foot_contact_count"] = RewardTermCfg(
+        func=_bpx_low_foot_contact_count_penalty,
+        weight=-0.8,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "command_name": "twist",
+            "min_contacts": 2.0,
+            "command_threshold": 0.05,
+        },
+    )
+    cfg.rewards["stand_still_foot_contact_count"] = RewardTermCfg(
+        func=_bpx_stand_still_foot_contact_count_penalty,
+        weight=-1.5,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "command_name": "twist",
+            "min_contacts": 4.0,
+            "command_threshold": 0.08,
+        },
+    )
     cfg.rewards["calf_ground_touch"] = RewardTermCfg(
         func=mdp.self_collision_cost,
         weight=-0.1,
@@ -669,11 +768,11 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cmd = cfg.commands["twist"]
     assert isinstance(cmd, UniformVelocityCommandCfg)
     cmd.viz.z_offset = 0.5
-    cmd.ranges.lin_vel_x = (-0.20, 0.75)
-    cmd.ranges.lin_vel_y = (-0.10, 0.10)
-    cmd.ranges.ang_vel_z = (-0.25, 0.25)
-    cmd.rel_standing_envs = 0.02
-    cmd.rel_forward_envs = 0.75
+    cmd.ranges.lin_vel_x = (-0.10, 0.55)
+    cmd.ranges.lin_vel_y = (-0.06, 0.06)
+    cmd.ranges.ang_vel_z = (-0.20, 0.20)
+    cmd.rel_standing_envs = 0.30
+    cmd.rel_forward_envs = 0.55
     cmd.resampling_time_range = (6.0, 10.0)
 
     cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
@@ -691,45 +790,33 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "velocity_stages": [
                 {
                     "step": 0,
-                    "lin_vel_x": (-0.20, 0.75),
-                    "lin_vel_y": (-0.10, 0.10),
-                    "ang_vel_z": (-0.25, 0.25),
+                    "lin_vel_x": (-0.10, 0.55),
+                    "lin_vel_y": (-0.06, 0.06),
+                    "ang_vel_z": (-0.20, 0.20),
                 },
                 {
                     "step": 6000 * 16,
-                    "lin_vel_x": (-0.30, 0.95),
-                    "lin_vel_y": (-0.18, 0.18),
-                    "ang_vel_z": (-0.40, 0.40),
+                    "lin_vel_x": (-0.15, 0.70),
+                    "lin_vel_y": (-0.08, 0.08),
+                    "ang_vel_z": (-0.25, 0.25),
                 },
                 {
-                    "step": 12000 * 16,
-                    "lin_vel_x": (-0.35, 1.10),
-                    "lin_vel_y": (-0.22, 0.22),
-                    "ang_vel_z": (-0.48, 0.48),
+                    "step": 14000 * 16,
+                    "lin_vel_x": (-0.20, 0.85),
+                    "lin_vel_y": (-0.10, 0.10),
+                    "ang_vel_z": (-0.30, 0.30),
                 },
                 {
-                    "step": 18000 * 16,
-                    "lin_vel_x": (-0.45, 1.25),
-                    "lin_vel_y": (-0.30, 0.30),
-                    "ang_vel_z": (-0.60, 0.60),
-                },
-                {
-                    "step": 26000 * 16,
-                    "lin_vel_x": (-0.50, 1.40),
-                    "lin_vel_y": (-0.30, 0.30),
-                    "ang_vel_z": (-0.60, 0.60),
+                    "step": 24000 * 16,
+                    "lin_vel_x": (-0.25, 1.00),
+                    "lin_vel_y": (-0.12, 0.12),
+                    "ang_vel_z": (-0.35, 0.35),
                 },
                 {
                     "step": 36000 * 16,
-                    "lin_vel_x": (-0.55, 1.60),
-                    "lin_vel_y": (-0.32, 0.32),
-                    "ang_vel_z": (-0.65, 0.65),
-                },
-                {
-                    "step": 45000 * 16,
-                    "lin_vel_x": (-0.60, 1.80),
-                    "lin_vel_y": (-0.35, 0.35),
-                    "ang_vel_z": (-0.70, 0.70),
+                    "lin_vel_x": (-0.30, 1.20),
+                    "lin_vel_y": (-0.15, 0.15),
+                    "ang_vel_z": (-0.45, 0.45),
                 },
             ],
         },
@@ -773,6 +860,15 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "base_lin_vel": deepcopy(base_critic_terms["base_lin_vel"]),
         "height_scan": deepcopy(base_critic_terms["height_scan"]),
     }
+    if not play:
+        for term_name in ("base_ang_vel", "projected_gravity"):
+            actor_terms[term_name].delay_min_lag = 0
+            actor_terms[term_name].delay_max_lag = 1
+            actor_terms[term_name].delay_hold_prob = 0.10
+        for term_name in ("joint_pos", "joint_vel"):
+            actor_terms[term_name].delay_min_lag = 0
+            actor_terms[term_name].delay_max_lag = 1
+            actor_terms[term_name].delay_hold_prob = 0.15
 
     cfg.observations = {
         "actor": ObservationGroupCfg(

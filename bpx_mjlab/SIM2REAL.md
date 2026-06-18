@@ -21,7 +21,7 @@ SDK 目录通常是：
 - policy 输出：12 维
 - action scale：0.25
 - 默认站姿：hip roll `0.0`，hip pitch `0.8`，knee `-1.5`
-- 最终 policy/sim2real PD：`kp=50.0`，`kd=0.8`
+- 最终 policy/sim2real PD：`kp=70.0`，`kd=0.9`
 - 低增益站立/吊起首测 PD：`kp=6.0`，`kd=0.35`
 - `leg_symmetry` 奖励已删除
 
@@ -94,6 +94,23 @@ model_50000.pt
 
 注意：不要从旧 checkpoint resume。旧模型的 history 是 15 帧或观测/动作顺序不同，和现在的 5 帧 sim2real 合同不兼容。
 
+训练端不要加入真机 `safe_guard` 限幅。`safe_guard` 只属于上层 UI 的真机首测保护，不能作为训练合同的一部分，否则策略会学到被截断后的动作边界，后期关掉保护时动作分布会变掉。当前训练侧仍然输出原始 12 维 policy action，再按 `action_scale=0.25` 转成目标关节角。
+
+针对右后腿启动 policy 后翘起、零速度命令下左右后腿不对称、小速度起步后左右晃动的问题，当前 rough 配置做了这些训练侧调整：
+
+- 零速度站立样本从 `rel_standing_envs=0.02` 提高到 `0.30`
+- 前进样本从 `rel_forward_envs=0.75` 降到 `0.55`，避免策略只偏向前冲
+- 速度 curriculum 从最高 `1.8m/s` 收到 `1.2m/s`，先保证稳定走再追速度
+- 删除额外的 fine velocity tracking 和 forward drift 小奖励，避免速度项过密
+- 增加 `raw_action_l2`，惩罚整体 raw action 过大
+- 增加 `stand_still_action_l2`，但降低权重，避免压掉必要的站姿修正动作
+- 增加 `stand_still_foot_contact_count`，要求零命令时四脚尽量都在地面
+- 关闭正向 `air_time` 奖励，避免单腿长期腾空也拿到步态收益
+- 增加 `long_air_time` 和 `low_foot_contact_count`，惩罚单脚悬空过久、运动时支撑脚过少
+- 关闭 `foot_clearance` / `foot_swing_height` 对摆高的驱动，减少不必要的高抬腿
+- 加强 encoder bias、reset joint、关节阻尼/摩擦/armature、PD gain 随机化，并让四个脚的 friction 独立随机
+- 训练态加入一拍以内的观测延迟，降低无延迟仿真和真机链路之间的差异
+
 ## 3. Play 检查模型
 
 先用零动作或随机动作检查环境：
@@ -127,6 +144,25 @@ Play 阶段重点看：
 - 动作是否过大或抖动
 - 是否频繁摔倒、侧偏、转圈
 - 脚尖接触是否正常，非脚部碰地是否明显
+
+如果出现“一条腿长期腾空、像瘸腿一样走”的情况，先不要继续导出真机。优先看 TensorBoard 里的：
+
+```text
+Metrics/air_time_mean
+Metrics/bpx_max_air_time
+Metrics/bpx_long_air_excess
+Metrics/bpx_foot_contact_count
+Metrics/bpx_stand_foot_contact_count
+Metrics/bpx_raw_action_abs_mean
+Metrics/bpx_raw_action_abs_max
+Episode_Reward/long_air_time
+Episode_Reward/low_foot_contact_count
+Episode_Reward/stand_still_foot_contact_count
+Episode_Reward/raw_action_l2
+Episode_Reward/stand_still_action_l2
+```
+
+`history_length=5` 对应 50Hz policy 下约 0.1s 的历史，比旧的 15 帧短很多；WAQ actor 没有 RNN，步态相位和接触状态主要靠这段历史推断。短历史更容易被奖励函数里的空子放大，所以当前配置关闭了正向 `air_time` 奖励，并额外惩罚单脚长时间腾空和运动时支撑脚过少。
 
 ## 4. 导出 sim2real TorchScript
 
@@ -256,6 +292,8 @@ sim_action = clip(policy_action, -100.0, 100.0)
 q_des_sim = default_joint_pos + sim_action * 0.25
 ```
 
+这里的 `clip(-100, 100)` 只是防止异常数值的极大范围保护，正常训练和严格 sim2sim 下等价于没有动作限幅。不要把真机 `safe_guard_clip=0.8`、`0.6`、`0.35` 这类保护限幅加入训练。
+
 默认关节位置：
 
 ```text
@@ -271,7 +309,7 @@ sent_action = clip(sim_action, -safe_guard_clip, safe_guard_clip)
 q_des_sim_sent = default_joint_pos + sent_action * 0.25
 ```
 
-首测必须开 safe guard，不要一上来严格 replay。
+首测必须开 safe guard，不要一上来严格 replay。确认稳定后可以逐步放开；最终真机如果要无 safeguard 跑，训练侧仍然不需要额外改限幅，只需要保证导出的 policy 和部署合同一致。
 
 ## 7. 与 SDK 和上层部署文件联动
 
@@ -364,8 +402,8 @@ bash scripts/08_check_sim2sim_contract.sh
 - joint order OK
 - default_joint_pos OK
 - action_scale = 0.25
-- sim_pd.kp = 50.0
-- sim_pd.kd = 0.8
+- sim_pd.kp = 70.0
+- sim_pd.kd = 0.9
 - obs scales OK
 - SDK index mapping OK
 - URDF limits OK
@@ -457,7 +495,7 @@ port = 8765
 9. START POLICY
 ```
 
-首测建议参数：
+吊起/支撑状态下，低增益只用于确认关节映射、动作符号和 IMU 方向：
 
 ```text
 Policy action guard: ON
@@ -472,15 +510,15 @@ vy limit: 0.05
 yaw limit: 0.25
 ```
 
-这里的 `Policy Kp=6.0, Policy Kd=0.35` 是低增益吊起/首测参数，不是最终可用增益。确认关节映射、IMU 方向、动作符号和 watchdog 都正确之后，再逐步提高到实测可用区间：
+这里的 `Policy Kp=6.0, Policy Kd=0.35` 不是最终可用增益，也不要求它能正常落地行走。确认关节映射、IMU 方向、动作符号和 watchdog 都正确之后，再逐步提高到当前训练合同：
 
 ```text
-Policy Kp: 6 -> 8 -> 10 -> 15 -> 20 -> 30 -> 40 -> 50
-Policy Kd: 0.35 -> 0.45 -> 0.6 -> 0.8
+Policy Kp: 30 -> 40 -> 50 -> 60 -> 70
+Policy Kd: 0.60 -> 0.80 -> 0.90
 Policy action clip: 0.05/0.08/0.12 先保守，再根据吊起响应放开
 ```
 
-当前训练侧最终合同按 `Kp=50.0, Kd=0.8` 重新训练；如果真机最终只在 `Kp=50` 左右能站稳，部署侧 `sim_pd` 也要同步成 `50.0/0.8`。
+当前训练侧最终合同按 `Kp=70.0, Kd=0.9` 重新训练；部署侧 `sim_pd` 也要同步成 `70.0/0.9`。不要训练用 70/0.9，真机又按 50/0.8 跑。
 
 如果抖动：
 
@@ -501,8 +539,8 @@ Command alpha: 0.12 -> 0.08
 ```text
 safe_guard OFF
 rate_limit OFF
-Kp = 50
-Kd = 0.8
+Kp = 70
+Kd = 0.9
 ```
 
 这样更接近训练/仿真合同，但真机风险更高，不适合第一次直接落地。
@@ -594,6 +632,27 @@ knee = -1.5
 ```
 
 训练端和部署端必须一致。
+
+### 启动 policy 后右后腿翘起
+
+先找最近的真机日志：
+
+```bash
+find /home/ubuntu/bpx_simreal_v6/bpx_simreal_v6_crouchfix_xwk/logs -name 'joint_policy_lab_*.jsonl' -printf '%T@ %p\n' | sort -n | tail
+```
+
+2026-06-16 的日志 `/home/ubuntu/bpx_simreal_v6/bpx_simreal_v6_crouchfix_xwk/logs/joint_policy_lab_20260616_183343.jsonl` 显示：低增益/标准站立阶段并不是唯一问题；进入 policy 后，在 `cmd_vx=0` 附近 raw action 已经明显左右不对称，随后给速度命令时 raw action 放大并被真机 safeguard 大量截断，最终表现为左右晃动和摔倒。
+
+这种情况优先按训练问题处理：重新训练当前 rough 配置，不要从旧 checkpoint resume；Play 时先看零命令启动 policy 是否仍有单腿翘起，再看小速度 `vx=0.10~0.20` 是否平滑。如果 Play 阶段已经单腿异常，不要导出真机。
+
+如果 Play 正常但真机仍只某一条腿明显异常，再回头检查硬件链路：
+
+```text
+configs/real_config_working.yaml 里的 sdk_index / scale / offset
+右后腿 encoder 零点
+右后腿 hip/knee 电机温度和是否有机械卡滞
+IMU roll/pitch 方向和符号
+```
 
 ### 观测维度不对
 
