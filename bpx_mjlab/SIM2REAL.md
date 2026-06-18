@@ -98,17 +98,19 @@ model_50000.pt
 
 针对右后腿启动 policy 后翘起、零速度命令下左右后腿不对称、小速度起步后左右晃动的问题，当前 rough 配置做了这些训练侧调整：
 
-- 零速度站立样本从 `rel_standing_envs=0.02` 提高到 `0.30`
-- 前进样本从 `rel_forward_envs=0.75` 降到 `0.55`，避免策略只偏向前冲
+- 零速度站立样本从默认 `0.02` 提高到 `0.20`，保留站稳能力但不过度压制起步
+- 前进样本设为 `rel_forward_envs=0.65`，保证早期能学出前进步态
 - 速度 curriculum 从最高 `1.8m/s` 收到 `1.2m/s`，先保证稳定走再追速度
+- 早期 rough 地形降低难度，初始地形等级从 `1` 降到 `0`，提高 flat 比例并降低台阶/坡度范围
 - 删除额外的 fine velocity tracking 和 forward drift 小奖励，避免速度项过密
-- 增加 `raw_action_l2`，惩罚整体 raw action 过大
-- 增加 `stand_still_action_l2`，但降低权重，避免压掉必要的站姿修正动作
+- 增强 `track_linear_velocity`，让策略在早期更愿意迈步追速度
+- 保留较弱的 `raw_action_l2` 和 `stand_still_action_l2`，避免压掉必要的起步动作
 - 增加 `stand_still_foot_contact_count`，要求零命令时四脚尽量都在地面
-- 关闭正向 `air_time` 奖励，避免单腿长期腾空也拿到步态收益
-- 增加 `long_air_time` 和 `low_foot_contact_count`，惩罚单脚悬空过久、运动时支撑脚过少
-- 关闭 `foot_clearance` / `foot_swing_height` 对摆高的驱动，减少不必要的高抬腿
-- 加强 encoder bias、reset joint、关节阻尼/摩擦/armature、PD gain 随机化，并让四个脚的 friction 独立随机
+- 恢复很小的正向 `air_time` 奖励，只奖励 `0.04~0.25s` 的短腾空
+- 保留 `long_air_time` 和 `low_foot_contact_count`，但降低权重，防止长期翘腿而不压死迈步
+- 移除 `foot_swing_height`，只保留较弱的 `foot_clearance`，避免过度刻意引导抬脚
+- 躯干触地仍然终止；大腿触地不再直接终止，改成 `thigh_ground_touch` 惩罚，避免早期训练被过早截断
+- 使用较温和的 encoder bias、reset joint、关节阻尼/摩擦/armature、PD gain 随机化，并让四个脚的 friction 独立随机
 - 训练态加入一拍以内的观测延迟，降低无延迟仿真和真机链路之间的差异
 
 ## 3. Play 检查模型
@@ -158,11 +160,15 @@ Metrics/bpx_raw_action_abs_max
 Episode_Reward/long_air_time
 Episode_Reward/low_foot_contact_count
 Episode_Reward/stand_still_foot_contact_count
+Episode_Reward/thigh_ground_touch
 Episode_Reward/raw_action_l2
 Episode_Reward/stand_still_action_l2
+Episode_Termination/illegal_contact
+Episode_Termination/fell_over
+Train/mean_episode_length
 ```
 
-`history_length=5` 对应 50Hz policy 下约 0.1s 的历史，比旧的 15 帧短很多；WAQ actor 没有 RNN，步态相位和接触状态主要靠这段历史推断。短历史更容易被奖励函数里的空子放大，所以当前配置关闭了正向 `air_time` 奖励，并额外惩罚单脚长时间腾空和运动时支撑脚过少。
+`history_length=5` 对应 50Hz policy 下约 0.1s 的历史，比旧的 15 帧短很多；WAQ actor 没有 RNN，步态相位和接触状态主要靠这段历史推断。短历史更容易被奖励函数里的空子放大，所以当前配置只给很小的短腾空 `air_time` 奖励，同时惩罚单脚长时间腾空和运动时支撑脚过少。
 
 ## 4. 导出 sim2real TorchScript
 

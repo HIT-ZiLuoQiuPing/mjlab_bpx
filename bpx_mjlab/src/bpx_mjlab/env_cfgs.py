@@ -47,7 +47,7 @@ THIGH_GEOMS = tuple(
     for idx in (0, 1)
 )
 TORSO_GEOMS = ("torso_collision_0", "torso_collision_1", "torso_collision_2")
-DANGEROUS_GROUND_GEOMS = (*TORSO_GEOMS, *THIGH_GEOMS)
+DANGEROUS_GROUND_GEOMS = TORSO_GEOMS
 
 
 def _bpx_action_scale_for_joint(joint_name: str) -> float:
@@ -500,13 +500,13 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     terrain_generator = deepcopy(ROUGH_TERRAINS_CFG)
     terrain_generator.curriculum = True
     terrain_proportions = {
-        "flat": 0.12,
-        "pyramid_stairs": 0.20,
-        "pyramid_stairs_inv": 0.08,
-        "hf_pyramid_slope": 0.25,
-        "hf_pyramid_slope_inv": 0.20,
+        "flat": 0.25,
+        "pyramid_stairs": 0.12,
+        "pyramid_stairs_inv": 0.05,
+        "hf_pyramid_slope": 0.20,
+        "hf_pyramid_slope_inv": 0.14,
         "random_rough": 0.08,
-        "wave_terrain": 0.07,
+        "wave_terrain": 0.06,
     }
     for terrain_name, proportion in terrain_proportions.items():
         if terrain_name in terrain_generator.sub_terrains:
@@ -515,12 +515,12 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         if terrain_name in terrain_generator.sub_terrains:
             stairs_cfg = terrain_generator.sub_terrains[terrain_name]
             stairs_cfg.step_width = 0.35
-            stairs_cfg.step_height_range = (0.04, 0.16)
+            stairs_cfg.step_height_range = (0.02, 0.10)
     for terrain_name in ("hf_pyramid_slope", "hf_pyramid_slope_inv"):
         if terrain_name in terrain_generator.sub_terrains:
-            terrain_generator.sub_terrains[terrain_name].slope_range = (0.0, 0.85)
+            terrain_generator.sub_terrains[terrain_name].slope_range = (0.0, 0.45)
     cfg.scene.terrain.terrain_generator = terrain_generator
-    cfg.scene.terrain.max_init_terrain_level = 1
+    cfg.scene.terrain.max_init_terrain_level = 0
     cfg.scene.extent = 3.0
 
     for sensor in cfg.scene.sensors or ():
@@ -564,6 +564,19 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         num_slots=1,
         history_length=4,
     )
+    thigh_ground_cfg = ContactSensorCfg(
+        name="thigh_ground_touch",
+        primary=ContactMatch(
+            mode="geom",
+            entity="robot",
+            pattern=THIGH_GEOMS,
+        ),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found", "force"),
+        reduce="none",
+        num_slots=1,
+        history_length=4,
+    )
     dangerous_ground_cfg = ContactSensorCfg(
         name="dangerous_ground_touch",
         primary=ContactMatch(
@@ -580,6 +593,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.scene.sensors = (cfg.scene.sensors or ()) + (
         feet_ground_cfg,
         calf_ground_cfg,
+        thigh_ground_cfg,
         dangerous_ground_cfg,
     )
 
@@ -599,19 +613,19 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             ("torso",),
         )
     if "encoder_bias" in cfg.events:
-        cfg.events["encoder_bias"].params["bias_range"] = (-0.05, 0.05)
+        cfg.events["encoder_bias"].params["bias_range"] = (-0.035, 0.035)
     if "reset_robot_joints" in cfg.events:
-        cfg.events["reset_robot_joints"].params["position_range"] = (-0.10, 0.10)
-        cfg.events["reset_robot_joints"].params["velocity_range"] = (-0.08, 0.08)
+        cfg.events["reset_robot_joints"].params["position_range"] = (-0.08, 0.08)
+        cfg.events["reset_robot_joints"].params["velocity_range"] = (-0.06, 0.06)
     if "push_robot" in cfg.events:
-        cfg.events["push_robot"].interval_range_s = (4.0, 7.0)
+        cfg.events["push_robot"].interval_range_s = (8.0, 12.0)
         cfg.events["push_robot"].params["velocity_range"] = {
-            "x": (-0.20, 0.20),
-            "y": (-0.20, 0.20),
-            "z": (-0.10, 0.10),
-            "roll": (-0.20, 0.20),
-            "pitch": (-0.20, 0.20),
-            "yaw": (-0.30, 0.30),
+            "x": (-0.12, 0.12),
+            "y": (-0.12, 0.12),
+            "z": (-0.06, 0.06),
+            "roll": (-0.12, 0.12),
+            "pitch": (-0.12, 0.12),
+            "yaw": (-0.18, 0.18),
         }
 
     if not play:
@@ -626,7 +640,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             params={
                 "asset_cfg": deepcopy(joint_randomization_cfg),
                 "operation": "scale",
-                "ranges": (0.70, 1.40),
+                "ranges": (0.80, 1.25),
                 "shared_random": False,
             },
         )
@@ -636,7 +650,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             params={
                 "asset_cfg": deepcopy(joint_randomization_cfg),
                 "operation": "abs",
-                "ranges": (0.0, 0.08),
+                "ranges": (0.0, 0.05),
                 "shared_random": False,
             },
         )
@@ -646,7 +660,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             params={
                 "asset_cfg": deepcopy(joint_randomization_cfg),
                 "operation": "scale",
-                "ranges": (0.70, 1.50),
+                "ranges": (0.80, 1.25),
                 "shared_random": False,
             },
         )
@@ -656,8 +670,8 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
                 "operation": "scale",
-                "kp_range": (0.85, 1.15),
-                "kd_range": (0.80, 1.25),
+                "kp_range": (0.90, 1.10),
+                "kd_range": (0.90, 1.15),
             },
         )
 
@@ -668,81 +682,82 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             ".*_knee_joint": 0.10,
         }
         cfg.rewards["pose"].params["std_walking"] = {
-            ".*_hip_roll_joint": 0.22,
-            ".*_hip_pitch_joint": 0.25,
-            ".*_knee_joint": 0.45,
+            ".*_hip_roll_joint": 0.30,
+            ".*_hip_pitch_joint": 0.35,
+            ".*_knee_joint": 0.65,
         }
         cfg.rewards["pose"].params["std_running"] = {
-            ".*_hip_roll_joint": 0.28,
-            ".*_hip_pitch_joint": 0.30,
-            ".*_knee_joint": 0.55,
+            ".*_hip_roll_joint": 0.35,
+            ".*_hip_pitch_joint": 0.40,
+            ".*_knee_joint": 0.75,
         }
     if "upright" in cfg.rewards:
         _safe_set_asset_names(cfg.rewards["upright"], "body_names", ("torso",))
         cfg.rewards["upright"].params["terrain_sensor_names"] = ("terrain_scan",)
     if "body_ang_vel" in cfg.rewards:
         _safe_set_asset_names(cfg.rewards["body_ang_vel"], "body_names", ("torso",))
-    for reward_name in ("foot_clearance", "foot_swing_height", "foot_slip"):
+    for reward_name in ("foot_clearance", "foot_slip"):
         if reward_name in cfg.rewards:
             _safe_set_asset_names(cfg.rewards[reward_name], "site_names", FOOT_SITES)
+    _safe_pop_term(cfg.rewards, "foot_swing_height")
 
     if "track_linear_velocity" in cfg.rewards:
-        cfg.rewards["track_linear_velocity"].weight = 2.8
-        cfg.rewards["track_linear_velocity"].params["std"] = 0.45
+        cfg.rewards["track_linear_velocity"].weight = 3.6
+        cfg.rewards["track_linear_velocity"].params["std"] = 0.38
     if "track_angular_velocity" in cfg.rewards:
-        cfg.rewards["track_angular_velocity"].weight = 1.6
+        cfg.rewards["track_angular_velocity"].weight = 1.4
         cfg.rewards["track_angular_velocity"].params["std"] = 0.55
     if "body_ang_vel" in cfg.rewards:
-        cfg.rewards["body_ang_vel"].weight = -0.08
+        cfg.rewards["body_ang_vel"].weight = -0.05
     if "angular_momentum" in cfg.rewards:
         cfg.rewards["angular_momentum"].weight = 0.0
     if "action_rate_l2" in cfg.rewards:
-        cfg.rewards["action_rate_l2"].weight = -0.10
+        cfg.rewards["action_rate_l2"].weight = -0.07
     cfg.rewards["raw_action_l2"] = RewardTermCfg(
         func=_bpx_raw_action_l2,
-        weight=-0.004,
+        weight=-0.0025,
     )
     cfg.rewards["stand_still_action_l2"] = RewardTermCfg(
         func=_bpx_stand_still_action_l2,
-        weight=-0.04,
+        weight=-0.025,
         params={
             "command_name": "twist",
             "command_threshold": 0.08,
         },
     )
     if "air_time" in cfg.rewards:
-        cfg.rewards["air_time"].weight = 0.0
+        cfg.rewards["air_time"].weight = 0.08
+        cfg.rewards["air_time"].params["threshold_min"] = 0.04
+        cfg.rewards["air_time"].params["threshold_max"] = 0.25
+        cfg.rewards["air_time"].params["command_threshold"] = 0.08
     if "foot_clearance" in cfg.rewards:
-        cfg.rewards["foot_clearance"].params["target_height"] = 0.08
-        cfg.rewards["foot_clearance"].weight = 0.0
-    if "foot_swing_height" in cfg.rewards:
-        cfg.rewards["foot_swing_height"].params["target_height"] = 0.08
-        cfg.rewards["foot_swing_height"].weight = 0.0
+        cfg.rewards["foot_clearance"].params["target_height"] = 0.06
+        cfg.rewards["foot_clearance"].weight = -0.12
     if "foot_slip" in cfg.rewards:
         cfg.rewards["foot_slip"].weight = -0.08
     cfg.rewards["long_air_time"] = RewardTermCfg(
         func=_bpx_long_air_time_penalty,
-        weight=-4.0,
+        weight=-2.5,
         params={
             "sensor_name": feet_ground_cfg.name,
             "command_name": "twist",
-            "max_air_time": 0.35,
-            "command_threshold": 0.05,
+            "max_air_time": 0.42,
+            "command_threshold": 0.08,
         },
     )
     cfg.rewards["low_foot_contact_count"] = RewardTermCfg(
         func=_bpx_low_foot_contact_count_penalty,
-        weight=-0.8,
+        weight=-0.55,
         params={
             "sensor_name": feet_ground_cfg.name,
             "command_name": "twist",
             "min_contacts": 2.0,
-            "command_threshold": 0.05,
+            "command_threshold": 0.08,
         },
     )
     cfg.rewards["stand_still_foot_contact_count"] = RewardTermCfg(
         func=_bpx_stand_still_foot_contact_count_penalty,
-        weight=-1.5,
+        weight=-0.9,
         params={
             "sensor_name": feet_ground_cfg.name,
             "command_name": "twist",
@@ -754,6 +769,11 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         func=mdp.self_collision_cost,
         weight=-0.1,
         params={"sensor_name": calf_ground_cfg.name},
+    )
+    cfg.rewards["thigh_ground_touch"] = RewardTermCfg(
+        func=mdp.self_collision_cost,
+        weight=-0.15,
+        params={"sensor_name": thigh_ground_cfg.name},
     )
     cfg.rewards["termination"] = RewardTermCfg(
         func=mdp.is_terminated,
@@ -768,11 +788,11 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cmd = cfg.commands["twist"]
     assert isinstance(cmd, UniformVelocityCommandCfg)
     cmd.viz.z_offset = 0.5
-    cmd.ranges.lin_vel_x = (-0.10, 0.55)
-    cmd.ranges.lin_vel_y = (-0.06, 0.06)
-    cmd.ranges.ang_vel_z = (-0.20, 0.20)
-    cmd.rel_standing_envs = 0.30
-    cmd.rel_forward_envs = 0.55
+    cmd.ranges.lin_vel_x = (-0.10, 0.65)
+    cmd.ranges.lin_vel_y = (-0.10, 0.10)
+    cmd.ranges.ang_vel_z = (-0.22, 0.22)
+    cmd.rel_standing_envs = 0.20
+    cmd.rel_forward_envs = 0.65
     cmd.resampling_time_range = (6.0, 10.0)
 
     cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
@@ -790,14 +810,14 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "velocity_stages": [
                 {
                     "step": 0,
-                    "lin_vel_x": (-0.10, 0.55),
-                    "lin_vel_y": (-0.06, 0.06),
-                    "ang_vel_z": (-0.20, 0.20),
+                    "lin_vel_x": (-0.10, 0.65),
+                    "lin_vel_y": (-0.10, 0.10),
+                    "ang_vel_z": (-0.22, 0.22),
                 },
                 {
                     "step": 6000 * 16,
                     "lin_vel_x": (-0.15, 0.70),
-                    "lin_vel_y": (-0.08, 0.08),
+                    "lin_vel_y": (-0.10, 0.10),
                     "ang_vel_z": (-0.25, 0.25),
                 },
                 {
