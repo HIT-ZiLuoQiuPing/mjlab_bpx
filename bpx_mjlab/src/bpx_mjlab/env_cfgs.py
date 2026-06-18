@@ -694,6 +694,8 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     if "upright" in cfg.rewards:
         _safe_set_asset_names(cfg.rewards["upright"], "body_names", ("torso",))
         cfg.rewards["upright"].params["terrain_sensor_names"] = ("terrain_scan",)
+        cfg.rewards["upright"].weight = 1.4
+        cfg.rewards["upright"].params["std"] = 0.38
     if "body_ang_vel" in cfg.rewards:
         _safe_set_asset_names(cfg.rewards["body_ang_vel"], "body_names", ("torso",))
     for reward_name in ("foot_clearance", "foot_slip"):
@@ -702,20 +704,20 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     _safe_pop_term(cfg.rewards, "foot_swing_height")
 
     if "track_linear_velocity" in cfg.rewards:
-        cfg.rewards["track_linear_velocity"].weight = 3.6
-        cfg.rewards["track_linear_velocity"].params["std"] = 0.38
+        cfg.rewards["track_linear_velocity"].weight = 3.0
+        cfg.rewards["track_linear_velocity"].params["std"] = 0.42
     if "track_angular_velocity" in cfg.rewards:
-        cfg.rewards["track_angular_velocity"].weight = 1.4
+        cfg.rewards["track_angular_velocity"].weight = 1.2
         cfg.rewards["track_angular_velocity"].params["std"] = 0.55
     if "body_ang_vel" in cfg.rewards:
-        cfg.rewards["body_ang_vel"].weight = -0.05
+        cfg.rewards["body_ang_vel"].weight = -0.10
     if "angular_momentum" in cfg.rewards:
         cfg.rewards["angular_momentum"].weight = 0.0
     if "action_rate_l2" in cfg.rewards:
-        cfg.rewards["action_rate_l2"].weight = -0.07
+        cfg.rewards["action_rate_l2"].weight = -0.10
     cfg.rewards["raw_action_l2"] = RewardTermCfg(
         func=_bpx_raw_action_l2,
-        weight=-0.0025,
+        weight=-0.0035,
     )
     cfg.rewards["stand_still_action_l2"] = RewardTermCfg(
         func=_bpx_stand_still_action_l2,
@@ -734,7 +736,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         cfg.rewards["foot_clearance"].params["target_height"] = 0.06
         cfg.rewards["foot_clearance"].weight = -0.12
     if "foot_slip" in cfg.rewards:
-        cfg.rewards["foot_slip"].weight = -0.08
+        cfg.rewards["foot_slip"].weight = -0.12
     cfg.rewards["long_air_time"] = RewardTermCfg(
         func=_bpx_long_air_time_penalty,
         weight=-2.5,
@@ -747,7 +749,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.rewards["low_foot_contact_count"] = RewardTermCfg(
         func=_bpx_low_foot_contact_count_penalty,
-        weight=-0.55,
+        weight=-0.85,
         params={
             "sensor_name": feet_ground_cfg.name,
             "command_name": "twist",
@@ -777,7 +779,7 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.rewards["termination"] = RewardTermCfg(
         func=mdp.is_terminated,
-        weight=-25.0,
+        weight=-35.0,
     )
 
     cfg.terminations["illegal_contact"] = TerminationTermCfg(

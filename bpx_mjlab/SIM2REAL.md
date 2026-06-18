@@ -103,11 +103,11 @@ model_50000.pt
 - 速度 curriculum 从最高 `1.8m/s` 收到 `1.2m/s`，先保证稳定走再追速度
 - 早期 rough 地形降低难度，初始地形等级从 `1` 降到 `0`，提高 flat 比例并降低台阶/坡度范围
 - 删除额外的 fine velocity tracking 和 forward drift 小奖励，避免速度项过密
-- 增强 `track_linear_velocity`，让策略在早期更愿意迈步追速度
-- 保留较弱的 `raw_action_l2` 和 `stand_still_action_l2`，避免压掉必要的起步动作
+- `track_linear_velocity` 不再过重，避免策略为了追速度牺牲支撑稳定性
+- 增强 `upright`、`body_ang_vel`、`action_rate_l2` 和 `raw_action_l2`，优先压住翻倒和动作尖峰
 - 增加 `stand_still_foot_contact_count`，要求零命令时四脚尽量都在地面
 - 恢复很小的正向 `air_time` 奖励，只奖励 `0.04~0.25s` 的短腾空
-- 保留 `long_air_time` 和 `low_foot_contact_count`，但降低权重，防止长期翘腿而不压死迈步
+- 保留 `long_air_time`，并提高 `low_foot_contact_count`，让移动时至少两脚支撑更稳定
 - 移除 `foot_swing_height`，只保留较弱的 `foot_clearance`，避免过度刻意引导抬脚
 - 躯干触地仍然终止；大腿触地不再直接终止，改成 `thigh_ground_touch` 惩罚，避免早期训练被过早截断
 - 使用较温和的 encoder bias、reset joint、关节阻尼/摩擦/armature、PD gain 随机化，并让四个脚的 friction 独立随机
