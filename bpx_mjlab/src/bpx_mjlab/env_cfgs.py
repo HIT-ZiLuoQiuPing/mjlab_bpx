@@ -7,6 +7,7 @@ from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -213,6 +214,51 @@ def _bpx_stand_still_foot_contact_count_penalty(
         torch.mean(contact_count * standing) / standing_ratio
     )
     return torch.square(torch.clamp(min_contacts - contact_count, min=0.0)) * standing
+
+
+def _bpx_track_axis_velocity(
+    env,
+    command_name: str,
+    axis: str,
+    std: float,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    if axis == "lin_y":
+        error = command[:, 1] - asset.data.root_link_lin_vel_b[:, 1]
+    elif axis == "yaw":
+        error = command[:, 2] - asset.data.root_link_ang_vel_b[:, 2]
+    else:
+        raise ValueError(f"Unsupported BPX velocity axis: {axis}")
+    return torch.exp(-(error.square()) / std**2)
+
+
+def _bpx_velocity_metric(
+    env,
+    command_name: str,
+    field: str,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    lin_vel = asset.data.root_link_lin_vel_b
+    ang_vel = asset.data.root_link_ang_vel_b
+    values = {
+        "cmd_vx": command[:, 0],
+        "cmd_vy": command[:, 1],
+        "cmd_wz": command[:, 2],
+        "vel_vx": lin_vel[:, 0],
+        "vel_vy": lin_vel[:, 1],
+        "vel_wz": ang_vel[:, 2],
+        "err_vx": torch.abs(command[:, 0] - lin_vel[:, 0]),
+        "err_vy": torch.abs(command[:, 1] - lin_vel[:, 1]),
+        "err_wz": torch.abs(command[:, 2] - ang_vel[:, 2]),
+    }
+    try:
+        return values[field]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported BPX velocity metric: {field}") from exc
 
 
 def _bpx_terrain_levels_vel(
@@ -709,6 +755,24 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     if "track_angular_velocity" in cfg.rewards:
         cfg.rewards["track_angular_velocity"].weight = 1.2
         cfg.rewards["track_angular_velocity"].params["std"] = 0.55
+    cfg.rewards["track_lateral_velocity"] = RewardTermCfg(
+        func=_bpx_track_axis_velocity,
+        weight=0.9,
+        params={
+            "command_name": "twist",
+            "axis": "lin_y",
+            "std": 0.18,
+        },
+    )
+    cfg.rewards["track_yaw_velocity"] = RewardTermCfg(
+        func=_bpx_track_axis_velocity,
+        weight=1.0,
+        params={
+            "command_name": "twist",
+            "axis": "yaw",
+            "std": 0.35,
+        },
+    )
     if "body_ang_vel" in cfg.rewards:
         cfg.rewards["body_ang_vel"].weight = -0.10
     if "angular_momentum" in cfg.rewards:
@@ -791,10 +855,10 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     assert isinstance(cmd, UniformVelocityCommandCfg)
     cmd.viz.z_offset = 0.5
     cmd.ranges.lin_vel_x = (-0.10, 0.65)
-    cmd.ranges.lin_vel_y = (-0.10, 0.10)
-    cmd.ranges.ang_vel_z = (-0.22, 0.22)
-    cmd.rel_standing_envs = 0.20
-    cmd.rel_forward_envs = 0.65
+    cmd.ranges.lin_vel_y = (-0.12, 0.12)
+    cmd.ranges.ang_vel_z = (-0.30, 0.30)
+    cmd.rel_standing_envs = 0.15
+    cmd.rel_forward_envs = 0.45
     cmd.resampling_time_range = (6.0, 10.0)
 
     cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
@@ -813,36 +877,54 @@ def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 {
                     "step": 0,
                     "lin_vel_x": (-0.10, 0.65),
-                    "lin_vel_y": (-0.10, 0.10),
-                    "ang_vel_z": (-0.22, 0.22),
-                },
-                {
-                    "step": 6000 * 16,
-                    "lin_vel_x": (-0.15, 0.70),
-                    "lin_vel_y": (-0.10, 0.10),
-                    "ang_vel_z": (-0.25, 0.25),
-                },
-                {
-                    "step": 14000 * 16,
-                    "lin_vel_x": (-0.20, 0.85),
-                    "lin_vel_y": (-0.10, 0.10),
+                    "lin_vel_y": (-0.12, 0.12),
                     "ang_vel_z": (-0.30, 0.30),
                 },
                 {
-                    "step": 24000 * 16,
-                    "lin_vel_x": (-0.25, 1.00),
-                    "lin_vel_y": (-0.12, 0.12),
-                    "ang_vel_z": (-0.35, 0.35),
+                    "step": 4000 * 16,
+                    "lin_vel_x": (-0.15, 0.75),
+                    "lin_vel_y": (-0.16, 0.16),
+                    "ang_vel_z": (-0.45, 0.45),
                 },
                 {
-                    "step": 36000 * 16,
+                    "step": 9000 * 16,
+                    "lin_vel_x": (-0.20, 0.90),
+                    "lin_vel_y": (-0.20, 0.20),
+                    "ang_vel_z": (-0.55, 0.55),
+                },
+                {
+                    "step": 16000 * 16,
+                    "lin_vel_x": (-0.25, 1.05),
+                    "lin_vel_y": (-0.25, 0.25),
+                    "ang_vel_z": (-0.65, 0.65),
+                },
+                {
+                    "step": 28000 * 16,
                     "lin_vel_x": (-0.30, 1.20),
-                    "lin_vel_y": (-0.15, 0.15),
-                    "ang_vel_z": (-0.45, 0.45),
+                    "lin_vel_y": (-0.30, 0.30),
+                    "ang_vel_z": (-0.75, 0.75),
                 },
             ],
         },
     )
+    for metric_name in (
+        "cmd_vx",
+        "cmd_vy",
+        "cmd_wz",
+        "vel_vx",
+        "vel_vy",
+        "vel_wz",
+        "err_vx",
+        "err_vy",
+        "err_wz",
+    ):
+        cfg.metrics[f"bpx_{metric_name}"] = MetricsTermCfg(
+            func=_bpx_velocity_metric,
+            params={
+                "command_name": "twist",
+                "field": metric_name,
+            },
+        )
 
     base_actor_terms = cfg.observations["actor"].terms
     base_critic_terms = cfg.observations["critic"].terms

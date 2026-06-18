@@ -96,14 +96,34 @@ model_50000.pt
 
 训练端不要加入真机 `safe_guard` 限幅。`safe_guard` 只属于上层 UI 的真机首测保护，不能作为训练合同的一部分，否则策略会学到被截断后的动作边界，后期关掉保护时动作分布会变掉。当前训练侧仍然输出原始 12 维 policy action，再按 `action_scale=0.25` 转成目标关节角。
 
-针对右后腿启动 policy 后翘起、零速度命令下左右后腿不对称、小速度起步后左右晃动的问题，当前 rough 配置做了这些训练侧调整：
+当前终端日志已经改成 BPX 精简版，重点看这些项目：
 
-- 零速度站立样本从默认 `0.02` 提高到 `0.20`，保留站稳能力但不过度压制起步
-- 前进样本设为 `rel_forward_envs=0.65`，保证早期能学出前进步态
+```text
+mean reward
+mean ep len
+terrain mean / max / up / down
+cmd range vx+ / vy+ / wz+
+cmd vx / vy / wz
+vel vx / vy / wz
+err vx / vy / wz
+err xy / yaw
+rew track xy / y / yaw / upright
+term fell / contact / timeout
+```
+
+TensorBoard 仍然保留完整 scalar，包括所有 reward、metric、loss 和性能项。终端变短只是为了训练时能快速判断是否真的在变好，不影响日志保存。
+
+针对右后腿启动 policy 后翘起、零速度命令下左右后腿不对称、小速度起步后左右晃动，以及 y/yaw 速度跟踪差的问题，当前 rough 配置做了这些训练侧调整：
+
+- 零速度站立样本设为 `rel_standing_envs=0.15`，保留站稳能力但不过度压制起步
+- 前进样本设为 `rel_forward_envs=0.45`，保留爬地形需要的直行样本，同时给 y/yaw 留出更多训练覆盖
 - 速度 curriculum 从最高 `1.8m/s` 收到 `1.2m/s`，先保证稳定走再追速度
+- y/yaw curriculum 提前展开，最高到 `vy=0.30m/s`、`wz=0.75rad/s`，避免策略只学会前后走
 - 早期 rough 地形降低难度，初始地形等级从 `1` 降到 `0`，提高 flat 比例并降低台阶/坡度范围
+- 地形晋级标准保持 `promotion_distance_ratio=0.75`、`demotion_command_ratio=0.5`，不要靠放宽晋级距离来制造“升级变快”的假象
 - 删除额外的 fine velocity tracking 和 forward drift 小奖励，避免速度项过密
 - `track_linear_velocity` 不再过重，避免策略为了追速度牺牲支撑稳定性
+- 增加单独的 `track_lateral_velocity` 和 `track_yaw_velocity`，让 y 方向和 yaw 方向的学习信号在日志里也能直接看到
 - 增强 `upright`、`body_ang_vel`、`action_rate_l2` 和 `raw_action_l2`，优先压住翻倒和动作尖峰
 - 增加 `stand_still_foot_contact_count`，要求零命令时四脚尽量都在地面
 - 恢复很小的正向 `air_time` 奖励，只奖励 `0.04~0.25s` 的短腾空
