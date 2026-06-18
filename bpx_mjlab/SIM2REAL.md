@@ -96,22 +96,44 @@ model_50000.pt
 
 训练端不要加入真机 `safe_guard` 限幅。`safe_guard` 只属于上层 UI 的真机首测保护，不能作为训练合同的一部分，否则策略会学到被截断后的动作边界，后期关掉保护时动作分布会变掉。当前训练侧仍然输出原始 12 维 policy action，再按 `action_scale=0.25` 转成目标关节角。
 
-当前终端日志已经改成 BPX 精简版，重点看这些项目：
+当前终端日志会保留 old-style 的可读行格式，但只打印能直接判断训练效果的项目：
 
 ```text
-mean reward
-mean ep len
-terrain mean / max / up / down
-cmd range vx+ / vy+ / wz+
-cmd vx / vy / wz
-vel vx / vy / wz
-err vx / vy / wz
-err xy / yaw
-rew track xy / y / yaw / upright
-term fell / contact / timeout
+Training health:
+  Mean reward
+  Mean episode length
+
+Terrain curriculum:
+  Mean terrain level
+  Maximum terrain level
+  Terrain promotion rate
+  Terrain demotion rate
+
+Velocity command curriculum:
+  Maximum forward command x
+  Maximum lateral command y
+  Maximum yaw command
+
+Velocity tracking:
+  Target velocity x / y / yaw
+  Actual velocity x / y / yaw
+  Absolute velocity error x / y / yaw
+  Built-in xy velocity error
+  Built-in yaw velocity error
+
+Important reward terms:
+  Linear velocity tracking reward
+  Lateral velocity tracking reward
+  Yaw velocity tracking reward
+  Upright reward
+
+Episode terminations:
+  Fell over episodes
+  Illegal contact episodes
+  Timed out episodes
 ```
 
-TensorBoard 仍然保留完整 scalar，包括所有 reward、metric、loss 和性能项。终端变短只是为了训练时能快速判断是否真的在变好，不影响日志保存。
+TensorBoard 仍然保留完整 scalar，包括所有 reward、metric、loss 和性能项。终端只删掉类似 raw action mean、landing force mean 这类不直观的噪声项，不再使用难读的缩写标签。
 
 针对右后腿启动 policy 后翘起、零速度命令下左右后腿不对称、小速度起步后左右晃动，以及 y/yaw 速度跟踪差的问题，当前 rough 配置做了这些训练侧调整：
 
