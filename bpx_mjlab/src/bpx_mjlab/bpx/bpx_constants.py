@@ -62,10 +62,32 @@ def get_spec() -> mujoco.MjSpec:
 EFFORT_LIMIT = 30.0
 
 ARMATURE = 0.005
-NATURAL_FREQ = 10.0 * 2.0 * 3.1415926535
-DAMPING_RATIO = 2.0
-STIFFNESS = ARMATURE * NATURAL_FREQ**2
-DAMPING = 2.0 * DAMPING_RATIO * ARMATURE * NATURAL_FREQ
+STIFFNESS = 70.0
+DAMPING = 0.9
+NATURAL_FREQ = (STIFFNESS / ARMATURE) ** 0.5
+DAMPING_RATIO = DAMPING / (2.0 * ARMATURE * NATURAL_FREQ)
+BPX_POLICY_ACTION_SCALE = 0.25
+
+BPX_SIM2REAL_JOINT_ORDER = (
+    "fl_hip_roll_joint",
+    "fr_hip_roll_joint",
+    "hl_hip_roll_joint",
+    "hr_hip_roll_joint",
+    "fl_hip_pitch_joint",
+    "fr_hip_pitch_joint",
+    "hl_hip_pitch_joint",
+    "hr_hip_pitch_joint",
+    "fl_knee_joint",
+    "fr_knee_joint",
+    "hl_knee_joint",
+    "hr_knee_joint",
+)
+
+BPX_STAND_JOINT_POS = {
+    ".*_hip_roll_joint": 0.0,
+    ".*_hip_pitch_joint": 0.8,
+    ".*_knee_joint": -1.5,
+}
 
 
 BPX_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
@@ -82,12 +104,8 @@ BPX_ACTUATOR_CFG = BuiltinPositionActuatorCfg(
 
 
 INIT_STATE = EntityCfg.InitialStateCfg(
-    pos=(0.0, 0.0, 0.42),
-    joint_pos={
-        ".*_hip_roll_joint": 0.0,
-        ".*_hip_pitch_joint": 0.6,
-        ".*_knee_joint": -1.2,
-    },
+    pos=(0.0, 0.0, 0.38),
+    joint_pos=BPX_STAND_JOINT_POS,
     joint_vel={".*": 0.0},
 )
 
@@ -134,7 +152,7 @@ BPX_ACTION_SCALE: dict[str, float] = {}
 for actuator in BPX_ARTICULATION.actuators:
     assert isinstance(actuator, BuiltinPositionActuatorCfg)
     for name_expr in actuator.target_names_expr:
-        BPX_ACTION_SCALE[name_expr] = 0.25 * EFFORT_LIMIT / STIFFNESS
+        BPX_ACTION_SCALE[name_expr] = BPX_POLICY_ACTION_SCALE
 
 
 if __name__ == "__main__":

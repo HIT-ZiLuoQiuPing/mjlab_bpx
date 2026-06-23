@@ -1,17 +1,94 @@
+from copy import deepcopy
+
+import torch
+
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
+from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
+from mjlab.managers.observation_manager import ObservationGroupCfg
+from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
-from mjlab.sensor import ContactMatch, ContactSensorCfg
+
+from mjlab.sensor import (
+    ContactMatch,
+    ContactSensorCfg,
+    ObjRef,
+    RayCastSensorCfg,
+    RingPatternCfg,
+    TerrainHeightSensorCfg,
+)
+
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
+from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 
 from bpx_mjlab.bpx.bpx_constants import (
     BPX_ACTION_SCALE,
+    BPX_SIM2REAL_JOINT_ORDER,
     FOOT_GEOMS,
     FOOT_SITES,
     get_bpx_robot_cfg,
 )
+
+
+_LEG_PREFIXES = ("fl", "fr", "hl", "hr")
+CALF_GEOMS = tuple(
+    f"{leg}_calf_link_collision_{idx}"
+    for leg in _LEG_PREFIXES
+    for idx in (0, 1)
+)
+THIGH_GEOMS = tuple(
+    f"{leg}_thigh_link_collision_{idx}"
+    for leg in _LEG_PREFIXES
+    for idx in (0, 1)
+)
+TORSO_GEOMS = ("torso_collision_0", "torso_collision_1", "torso_collision_2")
+DANGEROUS_GROUND_GEOMS = TORSO_GEOMS
+
+
+def _bpx_action_scale_for_joint(joint_name: str) -> float:
+    if joint_name.endswith("_hip_roll_joint"):
+        return BPX_ACTION_SCALE[".*_hip_roll_joint"]
+    if joint_name.endswith("_hip_pitch_joint"):
+        return BPX_ACTION_SCALE[".*_hip_pitch_joint"]
+    if joint_name.endswith("_knee_joint"):
+        return BPX_ACTION_SCALE[".*_knee_joint"]
+    raise ValueError(f"Unsupported BPX action joint: {joint_name}")
+
+
+def _make_bpx_simreal_actions() -> dict[str, JointPositionActionCfg]:
+    return {
+        f"joint_pos_{idx:02d}_{joint_name}": JointPositionActionCfg(
+            entity_name="robot",
+            actuator_names=(joint_name,),
+            scale=_bpx_action_scale_for_joint(joint_name),
+            use_default_offset=True,
+        )
+        for idx, joint_name in enumerate(BPX_SIM2REAL_JOINT_ORDER)
+    }
+
+
+def _configure_bpx_simreal_actor_terms(actor_terms: dict) -> None:
+    joint_asset_cfg = SceneEntityCfg(
+        "robot",
+        joint_names=BPX_SIM2REAL_JOINT_ORDER,
+        preserve_order=True,
+    )
+
+    actor_terms["base_ang_vel"].scale = 0.25
+    actor_terms["command"].scale = (2.0, 2.0, 0.25)
+    actor_terms["joint_vel"].scale = 0.05
+
+    actor_terms["joint_pos"].params["asset_cfg"] = deepcopy(joint_asset_cfg)
+    actor_terms["joint_vel"].params["asset_cfg"] = deepcopy(joint_asset_cfg)
+
+    for term in actor_terms.values():
+        term.clip = (-100.0, 100.0)
 
 
 def _safe_set_asset_names(term, field_name: str, names: tuple[str, ...]) -> bool:
@@ -50,6 +127,197 @@ def _safe_set_asset_names(term, field_name: str, names: tuple[str, ...]) -> bool
 def _safe_pop_term(term_dict, key: str) -> None:
     if term_dict is not None and key in term_dict:
         term_dict.pop(key, None)
+
+
+def _bpx_raw_action_l2(env) -> torch.Tensor:
+    action = env.action_manager.action
+    env.extras["log"]["Metrics/bpx_raw_action_abs_mean"] = torch.mean(torch.abs(action))
+    env.extras["log"]["Metrics/bpx_raw_action_abs_max"] = torch.max(torch.abs(action))
+    return torch.sum(torch.square(action), dim=1)
+
+
+def _bpx_stand_still_action_l2(
+    env,
+    command_name: str,
+    command_threshold: float = 0.08,
+) -> torch.Tensor:
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    command_norm = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    standing = (command_norm < command_threshold).float()
+    return torch.sum(torch.square(env.action_manager.action), dim=1) * standing
+
+
+def _bpx_long_air_time_penalty(
+    env,
+    sensor_name: str,
+    command_name: str,
+    max_air_time: float = 0.45,
+    command_threshold: float = 0.05,
+) -> torch.Tensor:
+    sensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time
+    assert air_time is not None
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    command_norm = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    active = (command_norm > command_threshold).float()
+
+    excess = torch.clamp(air_time - max_air_time, min=0.0)
+    max_air_time_batch = torch.max(air_time, dim=1).values
+    env.extras["log"]["Metrics/bpx_max_air_time"] = torch.mean(max_air_time_batch)
+    env.extras["log"]["Metrics/bpx_long_air_excess"] = torch.mean(excess)
+    return torch.sum(excess.square(), dim=1) * active
+
+
+def _bpx_low_foot_contact_count_penalty(
+    env,
+    sensor_name: str,
+    command_name: str,
+    min_contacts: float = 2.0,
+    command_threshold: float = 0.05,
+) -> torch.Tensor:
+    sensor = env.scene[sensor_name]
+    found = sensor.data.found
+    assert found is not None
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    command_norm = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    active = (command_norm > command_threshold).float()
+
+    contact_count = torch.sum((found > 0).float(), dim=1)
+    env.extras["log"]["Metrics/bpx_foot_contact_count"] = torch.mean(contact_count)
+    return torch.square(torch.clamp(min_contacts - contact_count, min=0.0)) * active
+
+
+def _bpx_stand_still_foot_contact_count_penalty(
+    env,
+    sensor_name: str,
+    command_name: str,
+    min_contacts: float = 4.0,
+    command_threshold: float = 0.08,
+) -> torch.Tensor:
+    sensor = env.scene[sensor_name]
+    found = sensor.data.found
+    assert found is not None
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    command_norm = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    standing = (command_norm < command_threshold).float()
+
+    contact_count = torch.sum((found > 0).float(), dim=1)
+    standing_ratio = torch.clamp(torch.mean(standing), min=1e-6)
+    env.extras["log"]["Metrics/bpx_stand_foot_contact_count"] = (
+        torch.mean(contact_count * standing) / standing_ratio
+    )
+    return torch.square(torch.clamp(min_contacts - contact_count, min=0.0)) * standing
+
+
+def _bpx_track_axis_velocity(
+    env,
+    command_name: str,
+    axis: str,
+    std: float,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    if axis == "lin_y":
+        error = command[:, 1] - asset.data.root_link_lin_vel_b[:, 1]
+    elif axis == "yaw":
+        error = command[:, 2] - asset.data.root_link_ang_vel_b[:, 2]
+    else:
+        raise ValueError(f"Unsupported BPX velocity axis: {axis}")
+    return torch.exp(-(error.square()) / std**2)
+
+
+def _bpx_velocity_metric(
+    env,
+    command_name: str,
+    field: str,
+) -> torch.Tensor:
+    asset = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    lin_vel = asset.data.root_link_lin_vel_b
+    ang_vel = asset.data.root_link_ang_vel_b
+    values = {
+        "cmd_vx": command[:, 0],
+        "cmd_vy": command[:, 1],
+        "cmd_wz": command[:, 2],
+        "vel_vx": lin_vel[:, 0],
+        "vel_vy": lin_vel[:, 1],
+        "vel_wz": ang_vel[:, 2],
+        "err_vx": torch.abs(command[:, 0] - lin_vel[:, 0]),
+        "err_vy": torch.abs(command[:, 1] - lin_vel[:, 1]),
+        "err_wz": torch.abs(command[:, 2] - ang_vel[:, 2]),
+    }
+    try:
+        return values[field]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported BPX velocity metric: {field}") from exc
+
+
+def _bpx_terrain_levels_vel(
+    env,
+    env_ids: torch.Tensor,
+    command_name: str,
+    promotion_distance_ratio: float = 0.75,
+    demotion_command_ratio: float = 0.5,
+) -> dict[str, torch.Tensor]:
+    asset = env.scene["robot"]
+    terrain = env.scene.terrain
+    assert terrain is not None
+    terrain_generator = terrain.cfg.terrain_generator
+    assert terrain_generator is not None
+
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+
+    distance = torch.norm(
+        asset.data.root_link_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2],
+        dim=1,
+    )
+    promotion_distance = terrain_generator.size[0] * promotion_distance_ratio
+
+    # 只有真正跑满 episode 的轨迹才允许升级，避免高等级地形过早堆上来。
+    timed_out = env.termination_manager.get_term("time_out")[env_ids]
+    move_up = (distance > promotion_distance) & timed_out
+
+    move_down = (
+        distance
+        < torch.norm(command[env_ids, :2], dim=1)
+        * env.max_episode_length_s
+        * demotion_command_ratio
+    )
+    move_down &= ~move_up
+
+    terrain.update_env_origins(env_ids, move_up, move_down)
+
+    levels = terrain.terrain_levels.float()
+    result: dict[str, torch.Tensor] = {
+        "mean": torch.mean(levels),
+        "max": torch.max(levels),
+        "promotion_distance": torch.tensor(promotion_distance, device=env.device),
+        "move_up_rate": torch.mean(move_up.float()),
+        "move_down_rate": torch.mean(move_down.float()),
+    }
+
+    sub_terrain_names = list(terrain_generator.sub_terrains.keys())
+    terrain_origins = terrain.terrain_origins
+    assert terrain_origins is not None
+    num_cols = terrain_origins.shape[1]
+    if num_cols == len(sub_terrain_names):
+        types = terrain.terrain_types
+        for i, name in enumerate(sub_terrain_names):
+            mask = types == i
+            if mask.any():
+                result[name] = torch.mean(levels[mask])
+
+    return result
 
 
 def bpx_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -128,7 +396,6 @@ def bpx_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 should_remove = True
 
         if should_remove:
-            print(f"remove reward term using raycast sensor: {reward_name}")
             cfg.rewards.pop(reward_name, None)
 
 
@@ -167,10 +434,8 @@ def bpx_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         nonfoot_ground_cfg,
     )
 
-    # 动作：12 个关节的位置控制。
-    joint_pos_action = cfg.actions["joint_pos"]
-    assert isinstance(joint_pos_action, JointPositionActionCfg)
-    joint_pos_action.scale = BPX_ACTION_SCALE
+    # 动作顺序严格对齐部署侧 type-major policy contract。
+    cfg.actions = _make_bpx_simreal_actions()
 
     # 尝试把默认 Go1/G1 的 body/site/geom 名字替换成 BPX。
     # 这里全部 safe，不存在就跳过，避免任务注册失败。
@@ -256,6 +521,490 @@ def bpx_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         if "actor" in cfg.observations:
             cfg.observations["actor"].enable_corruption = False
 
+        cfg.events.pop("push_robot", None)
+
+    return cfg
+
+
+def bpx_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    cfg = make_velocity_env_cfg()
+
+    cfg.sim.njmax = 1500
+    cfg.sim.nconmax = 192
+    cfg.sim.contact_sensor_maxmatch = 128
+    cfg.sim.mujoco.ccd_iterations = 50
+
+    cfg.scene.entities = {
+        "robot": get_bpx_robot_cfg(),
+    }
+    cfg.viewer.body_name = "torso"
+    cfg.viewer.distance = 2.5
+    cfg.viewer.elevation = -10.0
+
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.terrain_type = "generator"
+    terrain_generator = deepcopy(ROUGH_TERRAINS_CFG)
+    terrain_generator.curriculum = True
+    terrain_proportions = {
+        "flat": 0.25,
+        "pyramid_stairs": 0.12,
+        "pyramid_stairs_inv": 0.05,
+        "hf_pyramid_slope": 0.20,
+        "hf_pyramid_slope_inv": 0.14,
+        "random_rough": 0.08,
+        "wave_terrain": 0.06,
+    }
+    for terrain_name, proportion in terrain_proportions.items():
+        if terrain_name in terrain_generator.sub_terrains:
+            terrain_generator.sub_terrains[terrain_name].proportion = proportion
+    for terrain_name in ("pyramid_stairs", "pyramid_stairs_inv"):
+        if terrain_name in terrain_generator.sub_terrains:
+            stairs_cfg = terrain_generator.sub_terrains[terrain_name]
+            stairs_cfg.step_width = 0.35
+            stairs_cfg.step_height_range = (0.02, 0.10)
+    for terrain_name in ("hf_pyramid_slope", "hf_pyramid_slope_inv"):
+        if terrain_name in terrain_generator.sub_terrains:
+            terrain_generator.sub_terrains[terrain_name].slope_range = (0.0, 0.45)
+    cfg.scene.terrain.terrain_generator = terrain_generator
+    cfg.scene.terrain.max_init_terrain_level = 0
+    cfg.scene.extent = 3.0
+
+    for sensor in cfg.scene.sensors or ():
+        if sensor.name == "terrain_scan":
+            assert isinstance(sensor, RayCastSensorCfg)
+            assert isinstance(sensor.frame, ObjRef)
+            sensor.frame.name = "torso"
+            sensor.debug_vis = False
+        elif sensor.name == "foot_height_scan":
+            assert isinstance(sensor, TerrainHeightSensorCfg)
+            sensor.frame = tuple(
+                ObjRef(type="site", name=site_name, entity="robot")
+                for site_name in FOOT_SITES
+            )
+            sensor.pattern = RingPatternCfg.single_ring(radius=0.035, num_samples=4)
+            sensor.debug_vis = False
+
+    feet_ground_cfg = ContactSensorCfg(
+        name="feet_ground_contact",
+        primary=ContactMatch(
+            mode="geom",
+            pattern=FOOT_GEOMS,
+            entity="robot",
+        ),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found", "force"),
+        reduce="netforce",
+        num_slots=1,
+        track_air_time=True,
+    )
+    calf_ground_cfg = ContactSensorCfg(
+        name="calf_ground_touch",
+        primary=ContactMatch(
+            mode="geom",
+            entity="robot",
+            pattern=CALF_GEOMS,
+        ),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found", "force"),
+        reduce="none",
+        num_slots=1,
+        history_length=4,
+    )
+    thigh_ground_cfg = ContactSensorCfg(
+        name="thigh_ground_touch",
+        primary=ContactMatch(
+            mode="geom",
+            entity="robot",
+            pattern=THIGH_GEOMS,
+        ),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found", "force"),
+        reduce="none",
+        num_slots=1,
+        history_length=4,
+    )
+    dangerous_ground_cfg = ContactSensorCfg(
+        name="dangerous_ground_touch",
+        primary=ContactMatch(
+            mode="geom",
+            entity="robot",
+            pattern=DANGEROUS_GROUND_GEOMS,
+        ),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found", "force"),
+        reduce="none",
+        num_slots=1,
+        history_length=4,
+    )
+    cfg.scene.sensors = (cfg.scene.sensors or ()) + (
+        feet_ground_cfg,
+        calf_ground_cfg,
+        thigh_ground_cfg,
+        dangerous_ground_cfg,
+    )
+
+    cfg.actions = _make_bpx_simreal_actions()
+
+    if "foot_friction" in cfg.events:
+        _safe_set_asset_names(
+            cfg.events["foot_friction"],
+            "geom_names",
+            FOOT_GEOMS,
+        )
+        cfg.events["foot_friction"].params["shared_random"] = False
+    if "base_com" in cfg.events:
+        _safe_set_asset_names(
+            cfg.events["base_com"],
+            "body_names",
+            ("torso",),
+        )
+    if "encoder_bias" in cfg.events:
+        cfg.events["encoder_bias"].params["bias_range"] = (-0.035, 0.035)
+    if "reset_robot_joints" in cfg.events:
+        cfg.events["reset_robot_joints"].params["position_range"] = (-0.08, 0.08)
+        cfg.events["reset_robot_joints"].params["velocity_range"] = (-0.06, 0.06)
+    if "push_robot" in cfg.events:
+        cfg.events["push_robot"].interval_range_s = (8.0, 12.0)
+        cfg.events["push_robot"].params["velocity_range"] = {
+            "x": (-0.12, 0.12),
+            "y": (-0.12, 0.12),
+            "z": (-0.06, 0.06),
+            "roll": (-0.12, 0.12),
+            "pitch": (-0.12, 0.12),
+            "yaw": (-0.18, 0.18),
+        }
+
+    if not play:
+        joint_randomization_cfg = SceneEntityCfg(
+            "robot",
+            joint_names=BPX_SIM2REAL_JOINT_ORDER,
+            preserve_order=True,
+        )
+        cfg.events["bpx_joint_damping"] = EventTermCfg(
+            mode="startup",
+            func=dr.joint_damping,
+            params={
+                "asset_cfg": deepcopy(joint_randomization_cfg),
+                "operation": "scale",
+                "ranges": (0.80, 1.25),
+                "shared_random": False,
+            },
+        )
+        cfg.events["bpx_joint_friction"] = EventTermCfg(
+            mode="startup",
+            func=dr.joint_friction,
+            params={
+                "asset_cfg": deepcopy(joint_randomization_cfg),
+                "operation": "abs",
+                "ranges": (0.0, 0.05),
+                "shared_random": False,
+            },
+        )
+        cfg.events["bpx_joint_armature"] = EventTermCfg(
+            mode="startup",
+            func=dr.joint_armature,
+            params={
+                "asset_cfg": deepcopy(joint_randomization_cfg),
+                "operation": "scale",
+                "ranges": (0.80, 1.25),
+                "shared_random": False,
+            },
+        )
+        cfg.events["bpx_pd_gains"] = EventTermCfg(
+            mode="startup",
+            func=dr.pd_gains,
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "operation": "scale",
+                "kp_range": (0.90, 1.10),
+                "kd_range": (0.90, 1.15),
+            },
+        )
+
+    if "pose" in cfg.rewards:
+        cfg.rewards["pose"].params["std_standing"] = {
+            ".*_hip_roll_joint": 0.05,
+            ".*_hip_pitch_joint": 0.10,
+            ".*_knee_joint": 0.10,
+        }
+        cfg.rewards["pose"].params["std_walking"] = {
+            ".*_hip_roll_joint": 0.30,
+            ".*_hip_pitch_joint": 0.35,
+            ".*_knee_joint": 0.65,
+        }
+        cfg.rewards["pose"].params["std_running"] = {
+            ".*_hip_roll_joint": 0.35,
+            ".*_hip_pitch_joint": 0.40,
+            ".*_knee_joint": 0.75,
+        }
+    if "upright" in cfg.rewards:
+        _safe_set_asset_names(cfg.rewards["upright"], "body_names", ("torso",))
+        cfg.rewards["upright"].params["terrain_sensor_names"] = ("terrain_scan",)
+        cfg.rewards["upright"].weight = 1.4
+        cfg.rewards["upright"].params["std"] = 0.38
+    if "body_ang_vel" in cfg.rewards:
+        _safe_set_asset_names(cfg.rewards["body_ang_vel"], "body_names", ("torso",))
+    for reward_name in ("foot_clearance", "foot_slip"):
+        if reward_name in cfg.rewards:
+            _safe_set_asset_names(cfg.rewards[reward_name], "site_names", FOOT_SITES)
+    _safe_pop_term(cfg.rewards, "foot_swing_height")
+
+    if "track_linear_velocity" in cfg.rewards:
+        cfg.rewards["track_linear_velocity"].weight = 3.0
+        cfg.rewards["track_linear_velocity"].params["std"] = 0.42
+    if "track_angular_velocity" in cfg.rewards:
+        cfg.rewards["track_angular_velocity"].weight = 1.2
+        cfg.rewards["track_angular_velocity"].params["std"] = 0.55
+    cfg.rewards["track_lateral_velocity"] = RewardTermCfg(
+        func=_bpx_track_axis_velocity,
+        weight=0.9,
+        params={
+            "command_name": "twist",
+            "axis": "lin_y",
+            "std": 0.18,
+        },
+    )
+    cfg.rewards["track_yaw_velocity"] = RewardTermCfg(
+        func=_bpx_track_axis_velocity,
+        weight=1.0,
+        params={
+            "command_name": "twist",
+            "axis": "yaw",
+            "std": 0.35,
+        },
+    )
+    if "body_ang_vel" in cfg.rewards:
+        cfg.rewards["body_ang_vel"].weight = -0.10
+    if "angular_momentum" in cfg.rewards:
+        cfg.rewards["angular_momentum"].weight = 0.0
+    if "action_rate_l2" in cfg.rewards:
+        cfg.rewards["action_rate_l2"].weight = -0.10
+    cfg.rewards["raw_action_l2"] = RewardTermCfg(
+        func=_bpx_raw_action_l2,
+        weight=-0.0035,
+    )
+    cfg.rewards["stand_still_action_l2"] = RewardTermCfg(
+        func=_bpx_stand_still_action_l2,
+        weight=-0.025,
+        params={
+            "command_name": "twist",
+            "command_threshold": 0.08,
+        },
+    )
+    if "air_time" in cfg.rewards:
+        cfg.rewards["air_time"].weight = 0.08
+        cfg.rewards["air_time"].params["threshold_min"] = 0.04
+        cfg.rewards["air_time"].params["threshold_max"] = 0.25
+        cfg.rewards["air_time"].params["command_threshold"] = 0.08
+    if "foot_clearance" in cfg.rewards:
+        cfg.rewards["foot_clearance"].params["target_height"] = 0.06
+        cfg.rewards["foot_clearance"].weight = -0.12
+    if "foot_slip" in cfg.rewards:
+        cfg.rewards["foot_slip"].weight = -0.12
+    cfg.rewards["long_air_time"] = RewardTermCfg(
+        func=_bpx_long_air_time_penalty,
+        weight=-2.5,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "command_name": "twist",
+            "max_air_time": 0.42,
+            "command_threshold": 0.08,
+        },
+    )
+    cfg.rewards["low_foot_contact_count"] = RewardTermCfg(
+        func=_bpx_low_foot_contact_count_penalty,
+        weight=-0.85,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "command_name": "twist",
+            "min_contacts": 2.0,
+            "command_threshold": 0.08,
+        },
+    )
+    cfg.rewards["stand_still_foot_contact_count"] = RewardTermCfg(
+        func=_bpx_stand_still_foot_contact_count_penalty,
+        weight=-0.9,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "command_name": "twist",
+            "min_contacts": 4.0,
+            "command_threshold": 0.08,
+        },
+    )
+    cfg.rewards["calf_ground_touch"] = RewardTermCfg(
+        func=mdp.self_collision_cost,
+        weight=-0.1,
+        params={"sensor_name": calf_ground_cfg.name},
+    )
+    cfg.rewards["thigh_ground_touch"] = RewardTermCfg(
+        func=mdp.self_collision_cost,
+        weight=-0.15,
+        params={"sensor_name": thigh_ground_cfg.name},
+    )
+    cfg.rewards["termination"] = RewardTermCfg(
+        func=mdp.is_terminated,
+        weight=-35.0,
+    )
+
+    cfg.terminations["illegal_contact"] = TerminationTermCfg(
+        func=mdp.illegal_contact,
+        params={"sensor_name": dangerous_ground_cfg.name},
+    )
+
+    cmd = cfg.commands["twist"]
+    assert isinstance(cmd, UniformVelocityCommandCfg)
+    cmd.viz.z_offset = 0.5
+    cmd.ranges.lin_vel_x = (-0.10, 0.65)
+    cmd.ranges.lin_vel_y = (-0.12, 0.12)
+    cmd.ranges.ang_vel_z = (-0.30, 0.30)
+    cmd.rel_standing_envs = 0.15
+    cmd.rel_forward_envs = 0.45
+    cmd.resampling_time_range = (6.0, 10.0)
+
+    cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
+        func=_bpx_terrain_levels_vel,
+        params={
+            "command_name": "twist",
+            "promotion_distance_ratio": 0.75,
+            "demotion_command_ratio": 0.5,
+        },
+    )
+    cfg.curriculum["command_vel"] = CurriculumTermCfg(
+        func=mdp.commands_vel,
+        params={
+            "command_name": "twist",
+            "velocity_stages": [
+                {
+                    "step": 0,
+                    "lin_vel_x": (-0.10, 0.65),
+                    "lin_vel_y": (-0.12, 0.12),
+                    "ang_vel_z": (-0.30, 0.30),
+                },
+                {
+                    "step": 4000 * 16,
+                    "lin_vel_x": (-0.15, 0.75),
+                    "lin_vel_y": (-0.16, 0.16),
+                    "ang_vel_z": (-0.45, 0.45),
+                },
+                {
+                    "step": 9000 * 16,
+                    "lin_vel_x": (-0.20, 0.90),
+                    "lin_vel_y": (-0.20, 0.20),
+                    "ang_vel_z": (-0.55, 0.55),
+                },
+                {
+                    "step": 16000 * 16,
+                    "lin_vel_x": (-0.25, 1.05),
+                    "lin_vel_y": (-0.25, 0.25),
+                    "ang_vel_z": (-0.65, 0.65),
+                },
+                {
+                    "step": 28000 * 16,
+                    "lin_vel_x": (-0.30, 1.20),
+                    "lin_vel_y": (-0.30, 0.30),
+                    "ang_vel_z": (-0.75, 0.75),
+                },
+            ],
+        },
+    )
+    for metric_name in (
+        "cmd_vx",
+        "cmd_vy",
+        "cmd_wz",
+        "vel_vx",
+        "vel_vy",
+        "vel_wz",
+        "err_vx",
+        "err_vy",
+        "err_wz",
+    ):
+        cfg.metrics[f"bpx_{metric_name}"] = MetricsTermCfg(
+            func=_bpx_velocity_metric,
+            params={
+                "command_name": "twist",
+                "field": metric_name,
+            },
+        )
+
+    base_actor_terms = cfg.observations["actor"].terms
+    base_critic_terms = cfg.observations["critic"].terms
+    actor_term_names = (
+        "base_ang_vel",
+        "projected_gravity",
+        "command",
+        "joint_pos",
+        "joint_vel",
+        "actions",
+    )
+    privileged_term_names = (
+        "base_lin_vel",
+        "height_scan",
+        "foot_height",
+        "foot_air_time",
+        "foot_contact",
+        "foot_contact_forces",
+    )
+
+    actor_terms = {
+        name: deepcopy(base_actor_terms[name])
+        for name in actor_term_names
+    }
+    _configure_bpx_simreal_actor_terms(actor_terms)
+    critic_terms = {
+        name: deepcopy(actor_terms[name])
+        for name in actor_term_names
+    }
+    critic_terms.update(
+        {
+            name: deepcopy(base_critic_terms[name])
+            for name in privileged_term_names
+        }
+    )
+    estimator_target_terms = {
+        "base_lin_vel": deepcopy(base_critic_terms["base_lin_vel"]),
+        "height_scan": deepcopy(base_critic_terms["height_scan"]),
+    }
+    if not play:
+        for term_name in ("base_ang_vel", "projected_gravity"):
+            actor_terms[term_name].delay_min_lag = 0
+            actor_terms[term_name].delay_max_lag = 1
+            actor_terms[term_name].delay_hold_prob = 0.10
+        for term_name in ("joint_pos", "joint_vel"):
+            actor_terms[term_name].delay_min_lag = 0
+            actor_terms[term_name].delay_max_lag = 1
+            actor_terms[term_name].delay_hold_prob = 0.15
+
+    cfg.observations = {
+        "actor": ObservationGroupCfg(
+            terms=actor_terms,
+            concatenate_terms=True,
+            enable_corruption=not play,
+            nan_policy="sanitize",
+        ),
+        "actor_history": ObservationGroupCfg(
+            terms=deepcopy(actor_terms),
+            concatenate_terms=True,
+            enable_corruption=not play,
+            history_length=5,
+            flatten_history_dim=True,
+            nan_policy="sanitize",
+        ),
+        "critic": ObservationGroupCfg(
+            terms=critic_terms,
+            concatenate_terms=True,
+            enable_corruption=False,
+            nan_policy="sanitize",
+        ),
+        "estimator_target": ObservationGroupCfg(
+            terms=estimator_target_terms,
+            concatenate_terms=True,
+            enable_corruption=False,
+            nan_policy="sanitize",
+        ),
+    }
+
+    if play:
+        cfg.episode_length_s = int(1e9)
         cfg.events.pop("push_robot", None)
 
     return cfg
